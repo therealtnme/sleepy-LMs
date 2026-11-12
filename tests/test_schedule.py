@@ -59,6 +59,48 @@ def test_burst_fires_at_capacity_when_max_items_exceeds_it(workdir):
     assert ok and "burst" in why
 
 
+def test_burst_below_capacity_stays_under_the_ceiling(workdir):
+    """The clamp must not turn any non-empty buffer into a burst."""
+    from sleepy.buffer import Buffer, Item
+
+    buf = Buffer(workdir / "b.jsonl", capacity=400, seed=0)
+    for i in range(4):
+        buf.add(Item(1, i, "user", "x", "user"))
+    ok, why = due(buf, History(last_sleep_ts=1e12),
+                  Schedule(min_items=1, max_items=10, min_hours=24.0), now=1e12)
+    assert not ok and "below burst cap" in why
+
+
+def test_backoff_lifts_at_capacity_on_one_new_turn(workdir):
+    """`len()` is pinned at capacity, so growth must be read off `Buffer.added`."""
+    from sleepy.buffer import Buffer, Item
+
+    buf = Buffer(workdir / "b.jsonl", capacity=8, seed=0)
+    for i in range(8):
+        buf.add(Item(1, i, "user", "x", "user"))
+    hist = History(failures=3, failure_mark=buf.added)
+    assert not due(buf, hist, Schedule(min_items=1, min_hours=0.0), now=1e12)[0]
+
+    buf.add(Item(2, 0, "user", "new", "user"))
+
+    assert len(buf) == 8                       # evicted an add: the length never moved
+    assert due(buf, hist, Schedule(min_items=1, min_hours=0.0), now=1e12)[0]
+
+
+def test_backoff_stops_a_retry_storm_at_capacity(workdir):
+    """At capacity the burst would re-sleep every step; backoff comes first."""
+    from sleepy.buffer import Buffer, Item
+
+    buf = Buffer(workdir / "b.jsonl", capacity=8, seed=0)
+    for i in range(8):
+        buf.add(Item(1, i, "user", "x", "user"))
+    sched = Schedule(min_items=1, min_hours=0.0)
+    assert due(buf, History(), sched, now=1e12)[0], "no failures at cap must burst"
+
+    hist = History(failures=3, failure_mark=buf.added)
+    assert not due(buf, hist, sched, now=1e12)[0]
+
+
 def _cfg():
     return SleepConfig(tokenizer=StubTokenizer(), seq_len=16, budget_steps=4, passes=1)
 

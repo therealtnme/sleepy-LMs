@@ -270,10 +270,11 @@ Sleep is offline, not in the request path — the Paper 2 throughput cost is onl
 relevant if you consolidate during serving.
 
 * Trigger on **accumulated experience**: buffer ≥ `sleep_min_items`, and not
-  before `min_hours` since the last sleep. A burst at `max_items` bypasses the
-  wait — enough evidence outranks the clock. The buffer's `capacity` must be at
-  least `max_items`, or the burst threshold is unreachable and only the clock
-  ever fires.
+  before `min_hours` since the last sleep. A burst at `max_items` — clamped to
+  the buffer's `capacity`, so a `max_items` above `capacity` is reachable —
+  bypasses the wait: enough evidence outranks the clock. A burst does not,
+  however, outrank backoff: a commit that keeps failing would otherwise re-sleep
+  on every step at capacity, where the length is pinned and never falls.
 * The moment is gated by a **learned quiet window** (§8.1), not by a fixed hour.
 * **Budget cap** per sleep (steps, wall-clock, tokens). Hitting the cap truncates
   the N passes but never truncates the gate.
@@ -380,11 +381,15 @@ Resolved, with the evidence that closed each one:
   cannot schedule anything on its own, and with `quiet=False` the only trigger is
   the fixed `min_hours` period plus the burst cap.
 * **Backoff only lifts on new evidence.** `due()` idles once `failures` reaches
-  `backoff_sleeps`, and stays idle until the buffer grows past the size recorded
-  when the last failure landed (or a success resets the counter). A failure
-  caused by something other than the data — a bad rank, a saturated probe — must
-  wait for an unrelated turn before it can be retried, and the retry is offered
-  the same ladder. The counter is in-process, so a restart clears it.
+  `backoff_sleeps`, and stays idle until a turn is appended past the count
+  recorded when the last failure landed, or a success resets the counter. Growth
+  is the buffer's append count, not its length: at capacity an add evicts an add,
+  so the length is pinned and the log can fill, fail, and fill again with no
+  visible change. A failure caused by something other than the data — a bad rank,
+  a saturated probe — must therefore wait for an unrelated turn before it can be
+  retried, and the retry is offered the same ladder. The counter is in-process and
+  only the three commit paths write it, so a restart clears it; a slot or handoff
+  that never commits cannot back off.
 * **Concurrent appends are serialised; the reservoir is not.** The log takes a
   sidecar advisory lock (`msvcrt` locking on Windows), so records no longer
   interleave or vanish and a torn tail line is skipped on load. Two `Buffer`

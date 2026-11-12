@@ -48,6 +48,9 @@ class Buffer:
         self._items: list[Item] = []
         self._core: list[Item] = []
         self._seen = 0
+        # Append count, never decremented by eviction. `len()` pins at capacity,
+        # so "has anything new arrived?" cannot be asked of it.
+        self.added = 0
         self._load()
 
     # -- persistence -------------------------------------------------------
@@ -95,6 +98,7 @@ class Buffer:
             pool[it.key()] = it
         for it in pool.values():
             self._seen += 1
+            self.added += 1
             if len(self._items) < self.capacity:
                 self._items.append(it)
                 continue
@@ -159,6 +163,7 @@ class Buffer:
             self._core.append(item)
             return
         self._seen += 1
+        self.added += 1
         if len(self._items) < self.capacity:
             self._items.append(item)
             return

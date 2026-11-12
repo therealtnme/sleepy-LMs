@@ -87,7 +87,9 @@ fixed `min_hours` quiet period stands in, so a fresh deployment can still sleep.
 The evidence is the tier-0 log itself, so the window is rebuilt on restart and
 needs no store. Pass `quiet=False` for a purely fixed quiet period, or your own
 `QuietWindow(bins=…, width=…, half_life=…)` to tune it. A burst that fills the
-buffer to `max_items` outranks the window either way.
+buffer to `max_items` (or to `capacity`, whichever is lower) outranks the window
+either way, but not backoff: three consecutive refusals idle until a new turn
+arrives.
 
 The only clock in the mechanics is the one the window reads.
 

@@ -172,3 +172,33 @@ def test_distill_report_carries_the_gate_decision(pm, ladder, buffer):
     ok = distill(pm, ladder, src, tgt, buffer, cfg, steps=2)
 
     assert ok.gate_ok is True and ok.reason == "handoff"
+
+
+def _sleeper(pm, ladder, buffer, workdir, mcfg):
+    return Sleeper(pm, ladder, buffer, _cfg(), mcfg, Schedule(min_items=1, min_hours=0.0),
+                   workdir, quiet=False)
+
+
+def test_refused_merge_counts_a_failure_that_backs_off(pm, ladder, buffer, workdir):
+    """An always-refused merge would otherwise be retried every step forever."""
+    from sleepy.orchestrator import due
+
+    _train(pm, ladder, buffer)
+    s = _sleeper(pm, ladder, buffer, workdir, REFUSE)
+    s.hist.failure_mark = buffer.added
+
+    assert s.merge()["gate_ok"] is False
+    assert s.hist.failures == 1 and s.hist.failure_mark == buffer.added
+
+    s.hist.failures = 3
+    ok, why = due(buffer, s.hist, s.sched, now=1e12)
+    assert not ok and "backoff" in why
+
+
+def test_successful_merge_clears_the_failure_streak(pm, ladder, buffer, workdir):
+    _train(pm, ladder, buffer)
+    s = _sleeper(pm, ladder, buffer, workdir, ACCEPT)
+    s.hist.failures = 3
+
+    assert s.merge()["gate_ok"] is True
+    assert s.hist.failures == 0

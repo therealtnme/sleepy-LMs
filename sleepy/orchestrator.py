@@ -50,7 +50,7 @@ class History:
     base_norm0: float = 0.0
     slots_opened: int = 0
     failures: int = 0
-    failure_mark: int = 0              # buffer size when the last failure landed
+    failure_mark: int = 0              # Buffer.added when the last failure landed
     last_sleep_ts: float = 0.0
     merged_since_promote: int = 0
     gate_events: list[str] = field(default_factory=list)
@@ -75,12 +75,21 @@ def due(buffer: Buffer, hist: History, sched: Schedule, now: float | None = None
     row: nothing else clears the counter, so a streak would wedge the loop for
     good at three, with training unable to test its own fix. Fresh evidence is
     the thing a failure was waiting for.
+
+    Growth is read off `Buffer.added`, not `len(buffer)`: once the buffer is at
+    capacity every add evicts one, so the length is pinned and a failure recorded
+    there would never see the new turns that followed it.
+
+    Order is backoff, then burst, then window. At capacity the length is pinned,
+    so a burst with no new evidence would otherwise re-sleep on every step and
+    hammer a commit that is already failing; the backoff stops that, and a single
+    new turn is enough to lift it and let the burst through again.
     """
     now = time.time() if now is None else now
-    if hist.failures >= sched.backoff_sleeps and len(buffer) <= hist.failure_mark:
-        return False, f"backoff ({hist.failures} failures, no new experience)"
     if len(buffer) < sched.min_items:
         return False, f"buffer {len(buffer)} < {sched.min_items}"
+    if hist.failures >= sched.backoff_sleeps and buffer.added <= hist.failure_mark:
+        return False, f"backoff ({hist.failures} failures, no new experience)"
     if len(buffer) >= min(sched.max_items, buffer.capacity):
         return True, "burst: buffer at cap"
     if quiet is not None and quiet.calibrated:  # the window replaces the fixed period
@@ -203,16 +212,20 @@ class Sleeper:
         self.hist.core_losses.append(rep.core_loss)
         self.hist.gains.append(self._gain() if signals.finite(self._gain()) else 0.0)
         self.hist.slots_opened += 1
-        self.hist.failures = 0 if ok else self.hist.failures + 1
-        if not ok:
-            self.hist.failure_mark = len(self.buffer)
-
+        self._count(ok)
         row = rep.row() | {"event": "sleep", "note": note, "gate_baseline": baseline}
         self._probes("adapter", slot.name if ok else self._live_name())
         row |= self._plasticity_row()
         write_report([row], self.workdir / "sleep.jsonl")
         self._promote_replayed()
         return row
+
+    def _count(self, ok: bool) -> None:
+        """Record a commit outcome: a success resets the streak, a refusal stamps
+        the mark at the evidence it had already seen, so only later turns retry."""
+        self.hist.failures = 0 if ok else self.hist.failures + 1
+        if not ok:
+            self.hist.failure_mark = self.buffer.added
 
     def _live_name(self) -> str:
         live = self.ladder.live()
@@ -264,9 +277,7 @@ class Sleeper:
             release_slot(self.pm, self.ladder, tgt)
         # A refused handoff leaves the gains flat, so it would fire again next
         # step forever. Counting it as a failure lets backoff stop the loop.
-        self.hist.failures = 0 if rep.gate_ok else self.hist.failures + 1
-        if not rep.gate_ok:
-            self.hist.failure_mark = len(self.buffer)
+        self._count(rep.gate_ok)
         row = rep.row() | {"event": "handoff", "target": tgt.name}
         write_report([row], self.workdir / "sleep.jsonl")
         return row
@@ -277,6 +288,7 @@ class Sleeper:
             return {"event": "nothing-to-merge", "gate_ok": False}
         ok, rep = merge_slot(self.pm, self.ladder, src, self.buffer, self.cfg, self.mcfg)
         rep |= {"event": "merge", "slot": src.name}
+        self._count(ok)
         if ok:
             self.hist.merged_since_promote = 0
             self.hist.base_norm0 = signals.weight_norm_growth(self.pm)

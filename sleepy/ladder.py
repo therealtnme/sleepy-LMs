@@ -15,7 +15,6 @@ import torch
 from peft import LoraConfig, get_peft_model
 
 RANKS = (1, 1, 2, 4, 8, 16, 32, 64)
-RANK_SWEEP = (8, 16, 32, 64)
 
 
 class SlotState(str, Enum):
@@ -89,9 +88,6 @@ class Ladder:
 
     def exhausted(self) -> bool:
         return self.lowest_empty() is None
-
-    def top_rank(self) -> int:
-        return self.slots[-1].rank
 
 
 install_slots = None  # bound below, kept as a name for callers that import eagerly

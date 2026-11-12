@@ -2,4 +2,5 @@
 
 __version__ = "0.1.0"
 
-__all__ = ["buffer", "signals", "ladder", "sleep", "merge", "demo"]
+__all__ = ["buffer", "signals", "ladder", "sleep", "merge", "probe", "quiet",
+           "orchestrator", "demo"]

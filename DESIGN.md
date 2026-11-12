@@ -269,13 +269,44 @@ loss so they are on-policy but not self-referential.
 Sleep is offline, not in the request path — the Paper 2 throughput cost is only
 relevant if you consolidate during serving.
 
-* Trigger on **accumulated experience**: buffer ≥ `sleep_min_items` or ≥ 24h
-  since the last sleep, whichever first, and only in a low-traffic window.
+* Trigger on **accumulated experience**: buffer ≥ `sleep_min_items`, and not
+  before `min_hours` since the last sleep. A burst at `max_items` bypasses the
+  wait — enough evidence outranks the clock. The buffer's `capacity` must be at
+  least `max_items`, or the burst threshold is unreachable and only the clock
+  ever fires.
+* The moment is gated by a **learned quiet window** (§8.1), not by a fixed hour.
 * **Budget cap** per sleep (steps, wall-clock, tokens). Hitting the cap truncates
   the N passes but never truncates the gate.
 * One sleep at a time; a second trigger queues rather than runs concurrently.
 * A sleep that fails its gate marks the slot `quarantined` and leaves it out of
   inference; three failures back off the trigger.
+
+### 8.1 The quiet window
+
+The window is deliberately *not* a predictor and not a model. It histograms
+tier-0 interaction timestamps by hour of day, decays each bin by a half-life in
+days, and allows a sleep only in the lowest-traffic contiguous span. There is no
+second store: the histogram is rebuilt from the item log on replay each step,
+deduplicated by item key, and aged by real elapsed seconds — so an old history
+arrives pre-decayed instead of looking as fresh as the newest turn, and the
+window survives a restart for free.
+
+Three properties matter more than accuracy:
+
+* **Abstention.** Below `min_obs` contacts the window allows everything and
+  `min_hours` stands in. An uncalibrated window must never starve a fresh
+  deployment.
+* **Optional.** `quiet=False` restores the fixed quiet period exactly; the
+  default is on.
+* **Smoothing.** A circular 3-tap smooth runs before the span is scored, so one
+  stray contact beside the quiet span cannot carve it in half. Among tied spans
+  the one deepest into the empty gap wins, so a thin history still yields a real
+  window rather than breakfast time.
+
+Known limit: an hour-of-day histogram cannot express a weekend, a trip, or a
+timezone change; those show up only as decay-washed noise. The width, bins, and
+half-life are all constructor parameters if a deployment needs a different
+shape.
 
 ## 9. Known weak points
 
@@ -335,21 +366,37 @@ Resolved, with the evidence that closed each one:
 * **The gate runs after the commit and is undone**, where §5.2 gates before
   committing. The observable outcome matches because rollback is exact, but the
   window is wider than the design's.
-* **`distill()` reports success as failure.** It leaves `gate_ok` at its `False`
-  default, so a passing handoff is written to `sleep.jsonl` as a refused one.
-  `handoff()` gates on `kl_commit` itself, so the decision is right and the log
-  is wrong.
+* **§4.3's second condition is proxied, not measured.** It asks for a rank sweep
+  showing a higher rank still buys probe performance; `Sleeper._rank_bound()`
+  substitutes the frozen top slot's `effective_rank / rank` against
+  `eff_rank_floor`. That catches "the update uses little of its rank" but never
+  actually trains the bigger slot to see whether it helps, so a slot can be
+  wrongly declared rank-bound. The probe trend only delays the judgement until
+  it has `probe_calibration_sleeps` readings.
 * **`project()` is never called by merge or distill.** For the merge residual
   that is arguably correct — it should reproduce the base direction, not avoid
   it — but the handoff case is unexamined.
-* **`Schedule.eff_rank_floor` and `Schedule.dormant_alarm` are read by nothing**;
-  the two signals they name are logged but never gate anything.
+* **`quiet.allow()` is consulted only through `due()`.** The window therefore
+  cannot schedule anything on its own, and with `quiet=False` the only trigger is
+  the fixed `min_hours` period plus the burst cap.
+* **Backoff only lifts on new evidence.** `due()` idles once `failures` reaches
+  `backoff_sleeps`, and stays idle until the buffer grows past the size recorded
+  when the last failure landed (or a success resets the counter). A failure
+  caused by something other than the data — a bad rank, a saturated probe — must
+  wait for an unrelated turn before it can be retried, and the retry is offered
+  the same ladder. The counter is in-process, so a restart clears it.
+* **Concurrent appends are serialised; the reservoir is not.** The log takes a
+  sidecar advisory lock (`msvcrt` locking on Windows), so records no longer
+  interleave or vanish and a torn tail line is skipped on load. Two `Buffer`
+  objects over one path still hold independent in-memory pools, so each process's
+  view is stale relative to the other's writes until it reloads.
 
 ### 9.3 Closed since the first draft
 
-* Dead surface removed (`try_slots`,
-  `save_state`, the `install_slots`/`release_slot` re-export shim,
-  `Sleeper.rng`). The tree lints clean under `ruff` and carries a test suite.
+* Dead surface removed (`try_slots`, `save_state`, `Ladder.top_rank`,
+  `RANK_SWEEP`, `Sleeper.rng`). `install_slots` stays only as a name for eager
+  importers; `release_slot` is live and used by the refused-handoff path. The
+  tree lints clean under `ruff` and carries a test suite.
 * **`Buffer._load` replayed the log unbounded**, so a restart grew the live pool
   past capacity and re-added promoted core items to it. It now reruns the same
   reservoir the live path uses, and skips core keys — the on-disk double write
@@ -361,6 +408,19 @@ Resolved, with the evidence that closed each one:
 * The test tokenizer was non-deterministic, so a loss measured before a step was
   not comparable to one measured after it; it now hashes the text into a seeded
   generator.
+
+* **`distill()` reported success as failure.** It left `gate_ok` at its `False`
+  default, so a passing handoff was logged as a refused one and `handoff()`
+  re-decided the gate on its own. The measurement and the verdict now live
+  together in `distill()`, and `handoff()` trusts the report.
+* **The handoff was unreachable and leaked on refusal.** `step()` never called
+  it, so the tier-1→tier-1 path existed only as a method; a refused handoff now
+  releases the target slot instead of leaving it live and untrained-looking in
+  the forward pass, and counts as a failure so backoff can stop the retry loop.
+* **`Schedule.eff_rank_floor`, `dormant_alarm` and `probe_calibration_sleeps`
+  were read by nothing.** Dormant units now alarm the base path, the effective
+  rank ratio now gates handoff eligibility, and the probe trend delays that
+  judgement until it is calibrated.
 
 ## 10. Reference implementation
 

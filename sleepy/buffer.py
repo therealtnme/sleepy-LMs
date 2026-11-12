@@ -7,6 +7,7 @@ replayable instead of collapsing onto whatever was recent.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import random
 import time
@@ -59,7 +60,9 @@ class Buffer:
         guarantee, and the fixed seed makes the restart reproducible.
 
         A promoted item appears twice on disk (its first write, then its core write),
-        so core keys are collected first and the non-core copy skipped.
+        so core keys are collected first and the non-core copy skipped. The same
+        key written twice at the same session and turn — a replayed session, or an
+        older build banking a core item twice — is likewise counted once.
         """
         if not self.path.exists():
             return
@@ -69,15 +72,28 @@ class Buffer:
                 line = line.strip()
                 if not line:
                     continue
-                d = json.loads(line)
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    # A writer killed mid-line leaves a torn record; the log is
+                    # append-only, so the only recoverable move is to skip it.
+                    continue
                 rows.append(Item(**{k: d[k] for k in ("session", "turn", "role", "text", "source")},
                                  ts=d.get("ts", 0.0), tags=d.get("tags", []),
                                  is_core=bool(d.get("is_core"))))
         core_keys = {it.key() for it in rows if it.is_core}
-        self._core = [it for it in rows if it.is_core]
+        # A core item can appear more than once on disk when an older build
+        # banked it twice; keep the last copy so `_core` holds each key once.
+        by_key = {it.key(): it for it in rows if it.is_core}
+        self._core = list(by_key.values())
+        pool = {}
         for it in rows:
-            if it.is_core or it.key() in core_keys:
+            # A session replayed after a restart writes its turns twice; only the
+            # last copy joins the pool, so replay never trains a turn twice.
+            if it.key() in core_keys:
                 continue
+            pool[it.key()] = it
+        for it in pool.values():
             self._seen += 1
             if len(self._items) < self.capacity:
                 self._items.append(it)
@@ -86,11 +102,53 @@ class Buffer:
             if j < self.capacity:
                 self._items[j] = it
 
+    @property
+    def _lock_path(self) -> Path:
+        return self.path.with_suffix(self.path.suffix + ".lock")
+
+    @contextlib.contextmanager
+    def _locked(self):
+        """Exclusive advisory lock for one whole append.
+
+        Two processes append here — a live session and a sleep worker — and a
+        buffered text write is not atomic across processes on Windows, so records
+        interleave and lines are lost. The lock is a sidecar file rather than the
+        log itself: the log is append-only, so its length keeps moving, and a
+        byte-range lock on it would need a position that is stable under the very
+        appends it is meant to serialise.
+        """
+        with self._lock_path.open("a+b") as fh:
+            try:
+                import fcntl
+            except ImportError:  # Windows
+                import msvcrt
+
+                fh.seek(0)
+                while True:
+                    try:
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+                        break
+                    except OSError:  # LK_LOCK gives up after ~10s; take it again
+                        continue
+                try:
+                    yield
+                finally:
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
     def _append(self, item: Item) -> None:
-        with self.path.open("a", encoding="utf-8") as fh:
-            rec = asdict(item)
-            rec.pop("importance")
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        rec = asdict(item)
+        rec.pop("importance")
+        line = json.dumps(rec, ensure_ascii=False) + "\n"
+        with self._locked():
+            with self.path.open("a", encoding="utf-8") as fh:
+                fh.write(line)
 
     # -- writes ------------------------------------------------------------
     def add(self, item: Item, core: bool = False) -> None:
@@ -110,16 +168,26 @@ class Buffer:
         if j < self.capacity:
             self._items[j] = item
 
-    def add_turns(self, session: int, turns: Iterable[tuple[str, str, Provenance]]) -> None:
+    def add_turns(self, session: int, turns: Iterable[tuple[str, str, Provenance]],
+                  ts: float | None = None) -> None:
+        """Append a session's turns; `ts` stamps them on a caller-supplied clock."""
         for i, (role, text, source) in enumerate(turns):
-            self.add(Item(session=session, turn=i, role=role, text=text, source=source))
+            self.add(Item(session=session, turn=i, role=role, text=text, source=source,
+                          **(dict() if ts is None else {"ts": ts})))
 
     def bank_core(self, items: Iterable[Item]) -> None:
-        """Promote items to the permanent core set (they leave the sampled pool)."""
+        """Promote items to the permanent core set (they leave the sampled pool).
+
+        An item already banked is skipped: `add(core=True)` would append a second
+        core copy to the log, and `_load` would then hold it twice in `_core`.
+        """
+        items = list(items)
         keys = {it.key() for it in items}
         self._items = [it for it in self._items if it.key() not in keys]
+        banked = {it.key() for it in self._core}
         for it in items:
-            self.add(it, core=True)
+            if it.key() not in banked:
+                self.add(it, core=True)
 
     # -- reads -------------------------------------------------------------
     def __len__(self) -> int:

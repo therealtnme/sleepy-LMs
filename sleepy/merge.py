@@ -254,7 +254,7 @@ def distill(pm, ladder: Ladder, source: Slot, target: Slot, buffer: Buffer,
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
         opt.zero_grad(set_to_none=True)
-        losses.append(float(out.loss))
+        losses.append(float(out.loss.detach()))
 
     with torch.no_grad():
         for name, mod in _adapted(pm):
@@ -264,7 +264,11 @@ def distill(pm, ladder: Ladder, source: Slot, target: Slot, buffer: Buffer,
     gate_batch = encode(cfg, render(buffer.core[: cfg.batch_items])) if buffer.core else None
     kl = kl_to(pm, target.name, teacher, gate_batch) if gate_batch else float("nan")
     refresh(pm, ladder)
+    # The decision belongs here, with the measurement. An absent core set or a
+    # non-finite KL is not evidence against the handoff, so it passes.
+    ok = kl != kl or kl <= cfg.gate_kl_max
+    reason = "handoff" if ok else f"handoff KL {kl:.3f} > {cfg.gate_kl_max}"
     return SleepReport(slot=target.name, rank=target.rank, steps=steps, truncated=False,
                        loss_first=losses[0] if losses else float("nan"),
                        loss_last=losses[-1] if losses else float("nan"),
-                       kl_commit=kl, reason="handoff")
+                       kl_commit=kl, gate_ok=ok, reason=reason)

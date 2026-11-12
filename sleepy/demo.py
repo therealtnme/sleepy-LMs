@@ -9,6 +9,10 @@ able to learn at all).
 
 CPU only: expect minutes, not seconds. Numbers are meaningful in trend, not in
 absolute value.
+
+Sessions are stamped onto a simulated clock — daytime contact, small-hours
+sleeps — so the learned quiet window has something to learn. `--quiet off`
+restores the fixed quiet period.
 """
 
 from __future__ import annotations
@@ -16,6 +20,7 @@ from __future__ import annotations
 import argparse
 import random
 import tempfile
+import time
 from pathlib import Path
 
 import torch
@@ -26,6 +31,7 @@ from .ladder import RANKS, Ladder, attach
 from .merge import MergeConfig
 from .orchestrator import Schedule, Sleeper
 from .probe import Probe
+from .quiet import QuietWindow
 from .sleep import SleepConfig, batches_of
 
 FACTS = [
@@ -53,6 +59,9 @@ PROBE_FACTS = [
     ("the Bar", "a sand ridge that shifts each season"),
     ("Ines Corr", "the pilot who reads the bar soundings"),
 ]
+# The burst trigger is `len(buffer) >= max_items`, so the schedule's cap has to
+# match the buffer's — a smaller buffer can never reach a larger one.
+CAPACITY = 200
 
 
 def fact_turns(rng: random.Random, persona: str) -> list[Item]:
@@ -89,6 +98,8 @@ def main() -> None:
     ap.add_argument("--min-items", type=int, default=8)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--workdir", default=None)
+    ap.add_argument("--quiet", choices=("on", "off"), default="on",
+                    help="learned quiet window; 'off' uses the fixed quiet period")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -104,31 +115,64 @@ def main() -> None:
     ladder = Ladder.build(["down_proj", "v_proj"], ranks)
     pm = attach(model, ladder)
 
-    buffer = Buffer(workdir / "episodes.jsonl", capacity=200, seed=args.seed)
-    buffer.bank_core(core_items())
+    # Snap the simulated clock to local midnight so "15:00" means 15:00 local.
+    now = [time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1))]
+    day0 = now[0]
+
+    buffer = Buffer(workdir / "episodes.jsonl", capacity=CAPACITY, seed=args.seed)
+    core = core_items()
+    for it in core:  # the core set is asked in the same daytime slot sessions land in
+        it.ts = day0 + 15 * 3600.0
+    buffer.bank_core(core)
 
     cfg = SleepConfig(tokenizer=tok, seq_len=args.seq_len, passes=args.passes,
                       budget_steps=args.budget, seed=args.seed)
-    sched = Schedule(min_items=args.min_items, min_hours=0.0, merge_after_slots=3,
-                     stall_window=2)
+    sched = Schedule(min_items=args.min_items, max_items=CAPACITY, min_hours=0.0,
+                     merge_after_slots=3, stall_window=2)
     mcfg = MergeConfig(inner_steps=12, gate_kl_max=0.25)
     probe = Probe(probe_batches(tok, args.seq_len), steps=4)
 
     sleeper = Sleeper(pm=pm, ladder=ladder, buffer=buffer, cfg=cfg, mcfg=mcfg,
-                      sched=sched, workdir=workdir, probe=probe)
+                      sched=sched, workdir=workdir, probe=probe,
+                      clock=lambda: now[0],
+                      quiet=QuietWindow() if args.quiet == "on" else False)
+
+    def num(row: dict, key: str, fmt: str, width: int) -> str:
+        v = row.get(key)
+        if not isinstance(v, int | float) or v != v:  # missing, None or NaN
+            return f"{'-':>{width}}"
+        return f"{v:>{width}{fmt}}"
+
+    def line(row: dict) -> str:
+        """Fixed width, with a space after each cell so `3.4851.67e-04` cannot fuse."""
+        gate = row.get("gate_ok")
+        return (f"{str(row.get('event', '')):<9}{str(row.get('slot', '')):<6}"
+                f"{num(row, 'rank', 'd', 4)} {num(row, 'kl_commit', '.3f', 7)} "
+                f"{num(row, 'core_loss', '.3f', 7)} {num(row, 'delta_ratio', '.2e', 8)} "
+                f"{'' if gate is None else str(gate):>6}  "
+                f"{row.get('reason', row.get('note', ''))}")
 
     print(f"workdir {workdir}")
-    print(f"{'ev':<9}{'slot':<6}{'rank':>4}{'kl':>8}{'core':>8}{'drank':>7}{'gate':>6}  reason")
+    print(f"{'ev':<9}{'slot':<6}{'rank':>4} {'kl':>7} {'core':>7} {'drank':>8} {'gate':>6}  reason")
     for session in range(1, args.sessions + 1):
+        # A session lands mid-afternoon; the sleep it triggers waits for the
+        # small hours, so the clock jumps forward to meet the learned window.
+        now[0] = day0 + session * 86400.0 + 15 * 3600.0
         turns = fact_turns(rng, "the estuary")
         for it in turns:
             it.session = session
-        buffer.add_turns(session, [(i.role, i.text, i.source) for i in turns])
-        row = sleeper.step()
-        print(f"{row.get('event',''):<9}{row.get('slot',''):<6}{row.get('rank',0):>4}"
-              f"{row.get('kl_commit', float('nan')):>8.3f}{row.get('core_loss', float('nan')):>8.3f}"
-              f"{row.get('delta_ratio', float('nan')):>7.2e}{str(row.get('gate_ok')):>6}  "
-              f"{row.get('reason', row.get('note',''))}")
+        buffer.add_turns(session, [(i.role, i.text, i.source) for i in turns], ts=now[0])
+        for attempt in range(2):
+            row = sleeper.step()
+            print(line(row))
+            if row.get("event") != "idle":
+                break
+            w = sleeper.quiet.window() if sleeper.quiet else None
+            if w is None:
+                break
+            if attempt == 1:
+                break
+            now[0] = day0 + (session + 1) * 86400.0 + w[0] * 3600.0  # next window
         if row.get("event") == "idle" and "backoff" in row.get("reason", ""):
             print("backoff, stopping")
             break

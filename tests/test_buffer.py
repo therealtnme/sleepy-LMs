@@ -52,6 +52,66 @@ def test_bank_core_removes_the_item_from_the_sampled_pool(tmp_path):
     assert len(b) == 0 and len(b.core) == 1
 
 
+def test_torn_tail_line_is_skipped_on_load(tmp_path):
+    """A writer killed mid-record must not make the whole log unreadable."""
+    path = tmp_path / "e.jsonl"
+    b = Buffer(path, capacity=10, seed=0)
+    b.add(Item(1, 0, "user", "whole", "user"))
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write('{"session": 1, "turn": 1, "role": "us')
+
+    assert [i.text for i in Buffer(path, capacity=10, seed=0).all()] == ["whole"]
+
+
+def _append_many(path, session, n):
+    b = Buffer(path, capacity=10**9)
+    for i in range(n):
+        b.add(Item(session, i, "user", "x" * 100, "user"))
+
+
+def test_concurrent_appends_are_complete_and_parseable(tmp_path):
+    """A live session and a sleep worker append together; no record may tear."""
+    import multiprocessing as mp
+
+    # 4 x 100: at 4 x 40 an unlocked writer still gets away with it most runs.
+    path = str(tmp_path / "race.jsonl")
+    procs = [mp.Process(target=_append_many, args=(path, s, 100)) for s in range(4)]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(120)
+
+    lines = [ln for ln in (tmp_path / "race.jsonl").read_text(encoding="utf-8").splitlines()
+             if ln.strip()]
+    assert all(p.exitcode == 0 for p in procs)
+    assert len(lines) == 400
+    assert len(Buffer(path, capacity=10**9)) == 400
+
+
+def test_reload_counts_a_replayed_turn_once(tmp_path):
+    """A session replayed after a restart writes the same key twice, not twice over."""
+    path = tmp_path / "e.jsonl"
+    b = Buffer(path, capacity=10, seed=0)
+    b.add_turns(1, [("user", "q", "user"), ("assistant", "a", "model")])
+    b.add_turns(1, [("user", "q", "user"), ("assistant", "a", "model")])
+
+    assert [(i.role, i.text) for i in Buffer(path, capacity=10, seed=0).all()] == \
+        [("user", "q"), ("assistant", "a")]
+
+
+def test_bank_core_is_idempotent(tmp_path):
+    """Re-banking must not append a second core copy and strand it after reload."""
+    path = tmp_path / "e.jsonl"
+    b = Buffer(path, capacity=10, seed=0)
+    it = Item(0, 0, "user", "core fact", "user")
+    b.add(it)
+    b.bank_core([it])
+    b.bank_core([it])
+
+    assert [i.text for i in b.core] == ["core fact"]
+    assert [i.text for i in Buffer(path, capacity=10, seed=0).core] == ["core fact"]
+
+
 def test_provenance_survives_the_round_trip(tmp_path):
     path = tmp_path / "e.jsonl"
     b = Buffer(path, capacity=10, seed=0)

@@ -1,4 +1,4 @@
-# sleepy-lm — tiered sleep consolidation with rank-rotating adapters
+# sleepy-LMs — tiered sleep consolidation with rank-rotating adapters
 
 Design doc for a system that lets a deployed model learn from experience without
 destroying itself. Three tiers, increasing timescale, each with a hard rule about

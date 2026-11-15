@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sleepy-lm"
+name = "sleepy-LMs"
 version = "0.1.0"
 description = "Tiered sleep consolidation for language models: episodic buffer, rank-ladder adapters, gated base merges"
 readme = "README.md"

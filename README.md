@@ -1,4 +1,4 @@
-# sleepy-lm
+# sleepy-LMs
 
 A reference implementation of *tiered sleep consolidation* for language models:
 a deployed model that learns from experience without destroying itself.

@@ -138,60 +138,74 @@ def merge_slot(pm, ladder: Ladder, slot: Slot, buffer: Buffer, cfg: SleepConfig,
         p.requires_grad_(False)
     core_before = core_loss(before, slot.name, buffer.core, cfg)
 
-    # Every live slot is absorbed, not just the one passed in. DESIGN §5.2's commit
-    # step deletes all slots, so absorbing a single slot and zeroing the rest would
-    # silently delete the other frozen slots' knowledge.
-    sources = [s for s in ladder.live() if s is not slot] + [slot]
-    deltas: dict[str, torch.Tensor] = {}
-    for src in sources:
-        d = compute_deltas(pm, src.name, mcfg)
-        apply_deltas(pm, d, +1.0)
-        for name, t in d.items():
-            deltas[name] = deltas.get(name, 0.0) + t
-
-    # Student: prospective base, every slot silent except one residual recovering
-    # the teacher-student difference. All source knowledge now lives in the base.
-    # Snapshot first: the gate needs the original deltas back if it refuses.
+    # Snapshot before the first base write: an exception anywhere past here has to
+    # be able to undo it, and the slot tensors are part of what gets mutated.
     snap = _snapshot_slots(pm, ladder)
-    residual = _residual_slot(ladder, slot)
-    for s in ladder.slots:
-        if s is residual:
-            # A residual may be a slot straight off the ladder, so it can still
-            # hold a delta that is now in the base. Zero before it relives it.
-            zero_slot(pm, s)
-            open_slot(pm, ladder, s)
-        else:
-            release_slot(pm, ladder, s)
+    deltas: dict[str, torch.Tensor] = {}
+    applied = False
+    try:
+        # Every live slot is absorbed, not just the one passed in. DESIGN §5.2's
+        # commit step deletes all slots, so absorbing a single slot and zeroing the
+        # rest would silently delete the other frozen slots' knowledge.
+        sources = [s for s in ladder.live() if s is not slot] + [slot]
+        for src in sources:
+            d = compute_deltas(pm, src.name, mcfg)
+            apply_deltas(pm, d, +1.0)
+            applied = True
+            for name, t in d.items():
+                deltas[name] = deltas.get(name, 0.0) + t
 
-    # Teacher for the distillation is the prospective base with no adapters, so
-    # the residual is trained to reproduce the merge, not to re-add old deltas.
-    teacher = copy.deepcopy(pm)
-    teacher.eval()
-    for p in teacher.parameters():
-        p.requires_grad_(False)
+        # Student: prospective base, every slot silent except one residual
+        # recovering the teacher-student difference. All source knowledge now
+        # lives in the base.
+        residual = _residual_slot(ladder, slot)
+        for s in ladder.slots:
+            if s is residual:
+                # A residual may be a slot straight off the ladder, so it can
+                # still hold a delta that is now in the base. Zero before it
+                # relives it.
+                zero_slot(pm, s)
+                open_slot(pm, ladder, s)
+            else:
+                release_slot(pm, ladder, s)
 
-    items = buffer.core + buffer.all()[: cfg.k_important]
-    batches = batches_of(cfg, items) or [encode(cfg, "")]
-    params = [p for p in pm.parameters() if p.requires_grad]
-    if residual is not None:  # a ladder of one has nowhere to put the residual
-        opt = torch.optim.AdamW(params, lr=mcfg.inner_lr)
-        pm.train()
-        for i in range(mcfg.inner_steps):
-            batch = batches[i % len(batches)]
-            out = pm(**batch)
-            with torch.no_grad():
-                tlog = teacher(input_ids=batch["input_ids"],
-                               attention_mask=batch["attention_mask"]).logits
-            loss = signals.kl_guard(out.logits, tlog) + out.loss
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(params, 1.0)
-            opt.step()
-            opt.zero_grad(set_to_none=True)
+        # Teacher for the distillation is the prospective base with no adapters,
+        # so the residual is trained to reproduce the merge, not the old deltas.
+        teacher = copy.deepcopy(pm)
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad_(False)
 
-    student = residual.name if residual is not None else ""
-    gate_batch = encode(cfg, render(buffer.core[: cfg.batch_items]))
-    kl = kl_to(pm, student, teacher, gate_batch)
-    cl = core_loss(pm, student, buffer.core, cfg)
+        items = buffer.core + buffer.all()[: cfg.k_important]
+        batches = batches_of(cfg, items) or [encode(cfg, "")]
+        params = [p for p in pm.parameters() if p.requires_grad]
+        if residual is not None:  # a ladder of one has nowhere to put the residual
+            opt = torch.optim.AdamW(params, lr=mcfg.inner_lr)
+            pm.train()
+            for i in range(mcfg.inner_steps):
+                batch = batches[i % len(batches)]
+                out = pm(**batch)
+                with torch.no_grad():
+                    tlog = teacher(input_ids=batch["input_ids"],
+                                   attention_mask=batch["attention_mask"]).logits
+                loss = signals.kl_guard(out.logits, tlog) + out.loss
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(params, 1.0)
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+
+        student = residual.name if residual is not None else ""
+        gate_batch = encode(cfg, render(buffer.core[: cfg.batch_items]))
+        kl = kl_to(pm, student, teacher, gate_batch)
+        cl = core_loss(pm, student, buffer.core, cfg)
+    except Exception as e:  # an exception mid-window must not leak base edits
+        # `deltas` is the recorded sum of what was written, so it also undoes a
+        # partial absorb loop: it holds only the sources already applied.
+        if applied:
+            apply_deltas(pm, deltas, -1.0)
+        _restore_slots(pm, ladder, snap)
+        return False, {"gate_ok": False, "reason": f"exception: {type(e).__name__}: {e}",
+                       "core_before": core_before}
 
     ok, reason = True, "merged"
     if kl == kl and kl > mcfg.gate_kl_max:
@@ -226,48 +240,54 @@ def distill(pm, ladder: Ladder, source: Slot, target: Slot, buffer: Buffer,
              for name, mod in _adapted(pm) if source.name in mod.lora_A}
 
     open_slot(pm, ladder, target)
-    teacher = copy.deepcopy(pm)
-    teacher.eval()
-    for p in teacher.parameters():
-        p.requires_grad_(False)
-
-    with torch.no_grad():
-        for _, mod in _adapted(pm):
-            if source.name in mod.lora_B:
-                mod.lora_B[source.name].weight.zero_()
-    refresh(pm, ladder)
-
-    items = buffer.core + buffer.all()[: cfg.k_important]
-    batches = batches_of(cfg, items) or [encode(cfg, "")]
-    params = [p for p in pm.parameters() if p.requires_grad]
-    opt = torch.optim.AdamW(params, lr=cfg.lr * 0.5)
-    pm.train()
     losses = []
-    for i in range(steps):
-        batch = batches[i % len(batches)]
-        out = pm(**batch)
+    try:
+        teacher = copy.deepcopy(pm)
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad_(False)
+
         with torch.no_grad():
-            tlog = teacher(input_ids=batch["input_ids"],
-                           attention_mask=batch["attention_mask"]).logits
-        loss = signals.kl_guard(out.logits, tlog) + out.loss
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(params, 1.0)
-        opt.step()
-        opt.zero_grad(set_to_none=True)
-        losses.append(float(out.loss.detach()))
+            for _, mod in _adapted(pm):
+                if source.name in mod.lora_B:
+                    mod.lora_B[source.name].weight.zero_()
+        refresh(pm, ladder)
 
-    with torch.no_grad():
-        for name, mod in _adapted(pm):
-            if source.name in mod.lora_B:
-                mod.lora_B[source.name].weight.copy_(saved[name])
+        items = buffer.core + buffer.all()[: cfg.k_important]
+        batches = batches_of(cfg, items) or [encode(cfg, "")]
+        params = [p for p in pm.parameters() if p.requires_grad]
+        opt = torch.optim.AdamW(params, lr=cfg.lr * 0.5)
+        pm.train()
+        for i in range(steps):
+            batch = batches[i % len(batches)]
+            out = pm(**batch)
+            with torch.no_grad():
+                tlog = teacher(input_ids=batch["input_ids"],
+                               attention_mask=batch["attention_mask"]).logits
+            loss = signals.kl_guard(out.logits, tlog) + out.loss
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(params, 1.0)
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+            losses.append(float(out.loss.detach()))
 
-    gate_batch = encode(cfg, render(buffer.core[: cfg.batch_items])) if buffer.core else None
-    kl = kl_to(pm, target.name, teacher, gate_batch) if gate_batch else float("nan")
+        gate_batch = encode(cfg, render(buffer.core[: cfg.batch_items])) if buffer.core else None
+        kl = kl_to(pm, target.name, teacher, gate_batch) if gate_batch else float("nan")
+        # The decision belongs here, with the measurement. An absent core set or a
+        # non-finite KL is not evidence against the handoff, so it passes.
+        ok = kl != kl or kl <= cfg.gate_kl_max
+        reason = "handoff" if ok else f"handoff KL {kl:.3f} > {cfg.gate_kl_max}"
+    finally:
+        # Source B was zeroed for the whole window; restore it before reporting
+        # so an exception cannot leave the teacher slot deleted. The caller
+        # releases `target` on a refusal — or on the exception, which propagates
+        # with the source intact and the target still open.
+        with torch.no_grad():
+            for name, mod in _adapted(pm):
+                if source.name in mod.lora_B:
+                    mod.lora_B[source.name].weight.copy_(saved[name])
+
     refresh(pm, ladder)
-    # The decision belongs here, with the measurement. An absent core set or a
-    # non-finite KL is not evidence against the handoff, so it passes.
-    ok = kl != kl or kl <= cfg.gate_kl_max
-    reason = "handoff" if ok else f"handoff KL {kl:.3f} > {cfg.gate_kl_max}"
     return SleepReport(slot=target.name, rank=target.rank, steps=steps, truncated=False,
                        loss_first=losses[0] if losses else float("nan"),
                        loss_last=losses[-1] if losses else float("nan"),

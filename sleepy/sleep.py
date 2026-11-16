@@ -145,10 +145,26 @@ def kl_to(pm, adapter: str, teacher, batch: dict) -> float:
 
 
 def run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig) -> SleepReport:
-    """One sleep on a fresh slot. The caller applies the gate."""
+    """One sleep on a fresh slot. The caller applies the gate.
+
+    The slot is opened here, so it is also closed here: an exception anywhere
+    past `open_slot` quarantines it rather than leaving a half-trained slot live
+    in the forward pass. Stale gradients are dropped too — they would otherwise
+    accumulate into the next run's first backward.
+    """
     rng = random.Random(cfg.seed)
     open_slot(pm, ladder, slot)
 
+    try:
+        return _run(pm, ladder, buffer, slot, cfg, rng)
+    except Exception:
+        pm.zero_grad(set_to_none=True)
+        quarantine_slot(pm, ladder, slot)
+        raise
+
+
+def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
+         rng: random.Random) -> SleepReport:
     teacher = copy.deepcopy(pm)
     teacher.eval()
     for p in teacher.parameters():

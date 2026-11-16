@@ -220,7 +220,18 @@ class Sleeper:
 
         baseline = core_loss(self.pm, self._live_name(), self.buffer.core, self.cfg) \
             if self.ladder.live() else float("nan")
-        rep: SleepReport = run(self.pm, self.ladder, self.buffer, slot, self.cfg)
+        try:
+            rep: SleepReport = run(self.pm, self.ladder, self.buffer, slot, self.cfg)
+        except Exception as e:
+            # `run` already quarantined the slot; count it so backoff can stop a
+            # retry loop that would fail the same way, then let the caller see it.
+            self._count(False)
+            self._stamp_sleep()
+            row = {"event": "sleep", "slot": slot.name, "note": note, "gate_ok": False,
+                   "gate_baseline": baseline,
+                   "reason": f"exception: {type(e).__name__}: {e}"}
+            write_report([row], self.workdir / "sleep.jsonl")
+            raise
         ok = commit(self.pm, self.ladder, slot, rep, self.cfg, self._baseline())
         self._stamp_sleep()
         self.hist.core_losses.append(rep.core_loss)
@@ -325,7 +336,18 @@ class Sleeper:
         tgt = self.ladder.next_rank_up(src)
         if tgt is None:
             return {"event": "ladder-exhausted", "gate_ok": False}
-        rep = distill(self.pm, self.ladder, src, tgt, self.buffer, self.cfg)
+        try:
+            rep = distill(self.pm, self.ladder, src, tgt, self.buffer, self.cfg)
+        except Exception as e:
+            # `distill` restored the source in its `finally`; the target is still
+            # open and holding a partial delta, so releasing it restores the
+            # ladder exactly as it was.
+            release_slot(self.pm, self.ladder, tgt)
+            self._count(False)
+            row = {"event": "handoff", "target": tgt.name, "gate_ok": False,
+                   "reason": f"exception: {type(e).__name__}: {e}"}
+            write_report([row], self.workdir / "sleep.jsonl")
+            return row
         if rep.gate_ok:
             src.state = SlotState.FROZEN
             tgt.state = SlotState.FROZEN

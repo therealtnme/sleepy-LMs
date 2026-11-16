@@ -390,9 +390,6 @@ Resolved, with the evidence that closed each one:
 
 ### 9.2 Still open
 
-* **No `try`/`finally` across the mutate → gate window.** An exception in the
-  inner distillation loop (OOM, non-finite backward) leaves the base mutated and
-  the ladder emptied. Only a returned failure rolls back.
 * **The gate runs after the commit and is undone**, where §5.2 gates before
   committing. The observable outcome matches because rollback is exact, but the
   window is wider than the design's.
@@ -441,6 +438,11 @@ Resolved, with the evidence that closed each one:
   interleave or vanish and a torn tail line is skipped on load. Two `Buffer`
   objects over one path still hold independent in-memory pools, so each process's
   view is stale relative to the other's writes until it reloads.
+* **Only the merge residual is exception-safe, not the process.** The mutate →
+  gate window now rolls back in-memory state, but nothing is written to disk: a
+  kill -9 between the base write and the gate still loses the commit, because the
+  base is a live `nn.Module`, not a checkpoint. Durability across a crash needs a
+  weight snapshot on disk and is a different mechanism from this.
 
 ### 9.3 Closed since the first draft
 
@@ -460,6 +462,14 @@ Resolved, with the evidence that closed each one:
   not comparable to one measured after it; it now hashes the text into a seeded
   generator.
 
+* **No `try`/`finally` across the mutate → gate window** (closed 2026-11-16).
+  An exception in the inner distillation loop (OOM, non-finite backward) used to
+  leave the base mutated and the ladder emptied; only a returned failure rolled
+  back. The whole window in `merge_slot` is now guarded by the same snapshot and
+  recorded-delta undo the refusal path uses, the source restore in `distill` is a
+  `finally`, a raising `sleep.run` quarantines its slot, and `handoff()` releases
+  a target whose distillation raised. Three regressions force a failure after the
+  base is written and assert a bit-identical ladder and an unmutated base.
 * **`distill()` reported success as failure.** It left `gate_ok` at its `False`
   default, so a passing handoff was logged as a refused one and `handoff()`
   re-decided the gate on its own. The measurement and the verdict now live

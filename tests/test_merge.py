@@ -202,3 +202,102 @@ def test_successful_merge_clears_the_failure_streak(pm, ladder, buffer, workdir)
 
     assert s.merge()["gate_ok"] is True
     assert s.hist.failures == 0
+
+
+# -- exception safety across the mutate -> gate window ----------------------
+
+def _slots(pm, ladder):
+    snap = {}
+    for s in ladder.slots:
+        snap[s.name] = (s.state, s.failures, {
+            n: (m.lora_A[s.name].weight.detach().clone(),
+                m.lora_B[s.name].weight.detach().clone())
+            for n, m in _adapted(pm) if s.name in m.lora_A})
+    return snap
+
+
+def _assert_slots_equal(a, b):
+    assert {k: v[0] for k, v in a.items()} == {k: v[0] for k, v in b.items()}
+    assert {k: v[1] for k, v in a.items()} == {k: v[1] for k, v in b.items()}
+    for name in a:
+        for n in a[name][2]:
+            assert torch.equal(a[name][2][n][0], b[name][2][n][0]), (name, n)
+            assert torch.equal(a[name][2][n][1], b[name][2][n][1]), (name, n)
+
+
+def test_exception_mid_merge_restores_base_and_slots(pm, ladder, buffer, monkeypatch):
+    """The base is written before the gate; an OOM there must not leak the write."""
+    import sleepy.merge as mg
+
+    _train(pm, ladder, buffer)
+    before, slots = _weights(pm), _slots(pm, ladder)
+
+    def boom(*a, **k):
+        raise RuntimeError("oom")
+
+    # Raised after every slot is absorbed and the ladder is emptied, so a leak
+    # would show as both a mutated base and a deleted teacher slot.
+    delta = max(float(d.norm()) for d in compute_deltas(pm, "s0", ACCEPT).values())
+    monkeypatch.setattr(mg, "batches_of", boom)
+    ok, rep = merge_slot(pm, ladder, ladder.slots[0], buffer, _cfg(), ACCEPT)
+
+    assert ok is False
+    assert rep["reason"].startswith("exception: RuntimeError")
+    drift = _max_drift(before, _weights(pm))
+    assert drift < delta * 1e-4, f"base drifted {drift:.2e} on a {delta:.2e} delta"
+    _assert_slots_equal(slots, _slots(pm, ladder))
+
+
+def test_exception_mid_handoff_restores_the_source(pm, ladder, buffer, workdir, monkeypatch):
+    """The source's B is zeroed for the whole handoff window and must come back."""
+    import sleepy.merge as mg
+
+    _train(pm, ladder, buffer)
+    src = ladder.frozen()[-1]
+    tgt = ladder.next_rank_up(src)
+    before = {n: m.lora_B[src.name].weight.detach().clone()
+              for n, m in _adapted(pm) if src.name in m.lora_B}
+
+    def boom(*a, **k):
+        raise RuntimeError("oom")
+
+    sleep_cfg = _cfg()
+    s = Sleeper(pm, ladder, buffer, sleep_cfg, MergeConfig(inner_steps=2),
+                Schedule(min_items=1, min_hours=0.0), workdir, quiet=False)
+    with monkeypatch.context() as mp:
+        mp.setattr(mg, "batches_of", boom)
+        row = s.handoff()
+
+    assert row["gate_ok"] is False and row["reason"].startswith("exception:")
+    for n, m in _adapted(pm):
+        if src.name in m.lora_B:
+            assert torch.equal(m.lora_B[src.name].weight, before[n]), n
+    # The source still carries its delta, the target is back in the empty pool.
+    assert src.state is SlotState.FROZEN
+    assert tgt.state is SlotState.EMPTY
+    assert s.hist.failures == 1
+
+
+def test_exception_mid_sleep_quarantines_the_slot(pm, ladder, buffer, workdir):
+    """A half-trained slot must not be left live in the forward pass."""
+    import pytest
+
+    import sleepy.sleep as sl
+
+    s = _sleeper(pm, ladder, buffer, workdir, ACCEPT)
+
+    def boom(*a, **k):
+        raise RuntimeError("oom")
+
+    # Raised inside the step loop, after the slot is open and one forward in.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(sl.signals, "anneal", boom)
+        with pytest.raises(RuntimeError):
+            s.sleep_once()
+
+    slot = ladder.slots[0]
+    assert slot.state is SlotState.QUARANTINED
+    assert slot not in ladder.live()
+    assert s.hist.failures == 1
+    rows = (workdir / "sleep.jsonl").read_text(encoding="utf-8").splitlines()
+    assert "exception: RuntimeError" in rows[-1]

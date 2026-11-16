@@ -277,6 +277,47 @@ merge (§5), and if the merge does not help, the base needs unit resets.
 epochs, raise the replay ratio, lower LR. Note the direction of the confound —
 more capacity masks it and looks like it fixes it.
 
+### 6.1 Per-rank-component readouts
+
+The signals above are per-slot scalars. A slot is not uniform, though: its delta
+is a sum of rank components, `dW = Σᵢ bᵢ aᵢᵀ`, and components differ in whether
+the model *needs* them and whether they can still *move*. Two 8-bit vectors on
+each `Slot` (`sleepy/components.py`):
+
+* **Importance** — leave-one-out, `Iᵢ = max(0, L₋ᵢ − L_full)`, by actually
+  removing component `i` from the forward pass (both factors zeroed, restored
+  after). Costs a forward per probed component, so the probe set is the largest
+  `component_probes` components by output scale `‖bᵢ‖·‖aᵢ‖` — free, no forward
+  — and unprobed components take the probed median, so *unmeasured* reads neutral
+  rather than dead.
+* **Plasticity** — each component's share of the window's own gradient, from the
+  backward the step already ran. Free. A near-zero share means the component is
+  not absorbing anything whatever its delta looks like.
+
+Both are written **after** the training step, on the delta as it landed: probing
+before training reads an all-zero fresh slot and scores everything 0. Scores are
+EMA-smoothed across sleeps (`component_alpha`), because one forward per
+component is noisy enough that a single unlucky probe would condemn a component
+the model needs.
+
+Two corrections to leave-one-out, both implemented:
+
+* **Redundancy.** Two near-parallel components each look individually cheap and
+  are jointly essential. The `component_pairs` least-important probed components
+  are re-probed as pairs; any synergy `Iᵢⱼ − Iᵢ − Iⱼ > 0` is split between them.
+* **The free proxy is the ranking, not the truth.** Energy picks what to probe;
+  only the probe can overturn it, and only where it is wrong.
+
+**Where the readout changes a decision.** A readout that no gate consumes is
+telemetry. This one is consumed at merge (§5.2 step 3): `compute_deltas` drops the
+`sign_conflict` lowest-scored components *before* the magnitude threshold, and
+`component_floor` additionally strips components that never scored above
+`floor · sign_conflict`. Both exist because magnitude keeps exactly the wrong
+component — a large component that carries nothing is a big early direction,
+precisely what a threshold retains. Replacing a component with a fresh one is
+what `plasticity` decides, and it is the readout item 3 (optimizer rejuvenation)
+builds on.
+
 ## 7. Replay mix
 
 Order of protection, strongest first:
@@ -487,7 +528,8 @@ Resolved, with the evidence that closed each one:
 
 `sleepy/` implements the machinery against SmolLM2-135M on CPU: buffer,
 one-probe importance sampling, N-pass loop with gradient accumulation, rank
-ladder + handoff, KL/trust-region anchor, merge protocol, diffusion-block
+ladder + handoff, KL/trust-region anchor, merge protocol, per-rank-component
+importance/plasticity readouts feeding the merge, diffusion-block
 training with its matched-step A/B, and the full instrumentation table.
 `python -m sleepy.demo` runs a multi-session scenario with
 a synthetic knowledge stream and prints the signals above so the schedule can be

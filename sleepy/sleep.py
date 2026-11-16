@@ -14,7 +14,7 @@ from pathlib import Path
 
 import torch
 
-from . import signals
+from . import components, signals
 from .buffer import Buffer, Item, render
 from .ladder import Ladder, Slot, freeze_slot, open_slot, quarantine_slot
 
@@ -45,6 +45,16 @@ class SleepConfig:
     block: bool = False
     block_blocks: int = 2            # only honoured when `block` is on
     block_sigma: tuple[float, float] = (0.05, 0.60)
+    # Per-rank-component readouts. Off adds no forwards to a step; with it on,
+    # each sleep pays one probe forward per selected item before training.
+    components: bool = True
+    component_probes: int = 8        # components tested per sleep, most energetic first
+    component_pairs: int = 3         # pairwise re-probes for redundancy (see components)
+    component_alpha: float = 0.5     # EMA weight of the newest importance readout
+    # Components below this share of `sign_conflict` carry no measurable importance
+    # at every measurement and are dropped at merge, so a magnitude threshold does
+    # not keep what nothing needs. 0 disables it.
+    component_floor: float = 0.5
 
 
 @dataclass
@@ -59,11 +69,17 @@ class SleepReport:
     core_loss: float = float("nan")
     delta_ratio: float = float("nan")
     eff_rank: float = float("nan")
+    # Share of the slot's rank that is measurably needed / still taking gradient.
+    # At or near zero the slot is full of components nothing reads and nothing
+    # moves, which is the plasticity loss the ladder exists to avoid.
+    comp_live: float = float("nan")
+    comp_moving: float = float("nan")
     gate_ok: bool = False
     reason: str = ""
 
     KEYS = ("slot", "rank", "steps", "truncated", "loss_first", "loss_last",
-            "kl_commit", "core_loss", "delta_ratio", "eff_rank", "gate_ok", "reason")
+            "kl_commit", "core_loss", "delta_ratio", "eff_rank", "comp_live",
+            "comp_moving", "gate_ok", "reason")
 
     def row(self) -> dict:
         return {k: getattr(self, k) for k in self.KEYS}
@@ -170,14 +186,17 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
     for p in teacher.parameters():
         p.requires_grad_(False)
 
-    # Directions the frozen slots already write; nothing is projected off a fresh
-    # ladder, which is correct — there is no accumulated delta to protect yet.
-    occupied = signals.occupied_basis(pm, [s.name for s in ladder.frozen()],
-                                      cfg.project_k)
+    # Directions the frozen slots already write, per component; nothing is
+    # projected off a fresh ladder, which is correct — there is no accumulated
+    # delta to protect yet.
+    occupied = signals.component_bases(pm, slot.name, [s.name for s in ladder.frozen()],
+                                       cfg.project_k)
 
     candidates = [p for p in buffer.all() if p.key() not in {c.key() for c in buffer.core}]
     importance(pm, slot.name, candidates, cfg)
     items = select(buffer, cfg, rng, candidates)
+
+    energy = {"grad": torch.zeros(slot.rank)}
 
     batches = batches_of(cfg, items) or [encode(cfg, "")]
     params = [p for p in pm.parameters() if p.requires_grad]
@@ -223,6 +242,8 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
             batch_loss += float(lm_loss.detach())
         torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
         project(pm, slot.name, cfg, occupied)
+        if cfg.components:
+            components.accumulate(energy, components.gradient_energy(pm, slot.name))
         opt.step()
         opt.zero_grad(set_to_none=True)
         losses.append(batch_loss / cfg.passes)
@@ -236,6 +257,18 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
         signals.scale_slot(pm, slot.name, cfg.delta_cap / worst)
         worst = cfg.delta_cap
     slot.effective_rank = signals.effective_rank(pm, slot.name)
+    # Measured after the step, on the delta as it actually landed: a component
+    # that carries nothing reads zero however much of it was trained. Smoothed
+    # against the previous readout where there is one, since one forward per
+    # component is noisy enough for a single unlucky probe to condemn a needed one.
+    if cfg.components and items:
+        fresh = components.measure(pm, slot.name, encode(cfg, render(items[: cfg.batch_items])),
+                                   cfg.component_probes, cfg.component_pairs)
+        prev = slot.importance
+        slot.importance = (components.smooth(prev, fresh, cfg.component_alpha)
+                           if prev is not None and fresh is not None
+                           and prev.numel() == fresh.numel() else fresh)
+        slot.plasticity = components.quantize(components.shares(energy, slot.rank))
 
     gate_batch = encode(cfg, render(buffer.core[: cfg.batch_items])) if buffer.core else None
     return SleepReport(
@@ -244,7 +277,10 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
         loss_last=losses[-1] if losses else float("nan"),
         kl_commit=kl_to(pm, slot.name, teacher, gate_batch) if gate_batch else float("nan"),
         core_loss=core_loss(pm, slot.name, buffer.core, cfg),
-        delta_ratio=worst, eff_rank=slot.effective_rank)
+        delta_ratio=worst, eff_rank=slot.effective_rank,
+        comp_live=components.live_fraction(slot.importance),
+        comp_moving=(float((slot.plasticity > 0).float().mean())
+                     if slot.plasticity is not None else float("nan")))
 
 
 def commit(pm, ladder: Ladder, slot: Slot, rep: SleepReport, cfg: SleepConfig,
@@ -265,23 +301,32 @@ def commit(pm, ladder: Ladder, slot: Slot, rep: SleepReport, cfg: SleepConfig,
     return rep.gate_ok
 
 
-def project(pm, adapter: str, cfg: SleepConfig, occupied: dict | None = None) -> None:
-    """Strip the B-gradient out of directions the frozen slots already write.
+def project(pm, adapter: str, cfg: SleepConfig, bases: dict | None = None) -> None:
+    """Strip each B-gradient row out of the frozen directions it overlaps.
 
     Useful only when there are frozen slots. Inside a single fresh slot there is
     no accumulated delta to protect, and projecting off the gradient's own top
     directions strips up to `project_k`/rank of every step — at rank <= project_k
     it strips all of it, which is why the delta stalled at exactly zero.
+
+    Projection is per component, against that component's own conflicting frozen
+    columns, not the whole update against a module-wide basis: rank 32 against 64
+    frozen columns has zero spare width, and a module-wide projection there
+    removes the entire gradient.
     """
-    if not occupied:
+    if not bases:
         return
     for name, mod in signals.adapted_modules(pm):
         b = getattr(mod, "lora_B", None)
         if b is None or adapter not in b or b[adapter].weight.grad is None:
             continue
-        basis = occupied.get(name)
-        if basis is not None:
-            b[adapter].weight.grad = signals.project_off_basis(b[adapter].weight.grad, basis)
+        basis = bases.get(name)
+        if basis is None or basis.shape[0] != b[adapter].weight.shape[0]:
+            continue
+        grad = b[adapter].weight.grad
+        for i in range(grad.shape[0]):
+            columns = basis[i, :, :].T          # padded with zeros: no-op
+            grad[i] = signals.project_off_basis(grad[i], columns)
 
 
 def write_report(rows: list[dict], path: Path) -> None:

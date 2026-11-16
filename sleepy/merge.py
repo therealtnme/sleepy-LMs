@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 import torch
 
-from . import signals
+from . import components, signals
 from .buffer import Buffer, render
 from .ladder import (
     Ladder,
@@ -61,15 +61,42 @@ def ties_truncate(delta: torch.Tensor, conflict: float) -> torch.Tensor:
     return torch.where(delta.abs() >= thresh, delta, torch.zeros_like(delta))
 
 
-def compute_deltas(pm, adapter: str, cfg: MergeConfig) -> dict[str, torch.Tensor]:
-    """dW for every adapted module: s * truncate(delta). Does not apply."""
+def compute_deltas(pm, adapter: str, cfg: MergeConfig,
+                   slot: Slot | None = None,
+                   floor: float = 0.0) -> dict[str, torch.Tensor]:
+    """dW for every adapted module: s * truncate(delta). Does not apply.
+
+    Measured importance, when the slot carries it, drops whole rank components
+    ahead of the magnitude threshold: a component nothing depends on is exactly
+    what a magnitude threshold keeps, because it is usually a large early one.
+    `floor` first strips components that never scored, keeping `sign_conflict`
+    as the truncation mass either way.
+    """
+    mask = None
+    if slot is not None and slot.importance is not None:
+        mask = components.keep_mask(slot.importance, cfg.sign_conflict)
+        # `keep_mask` returns None when nothing would be dropped, but the floor
+        # still applies then: at `sign_conflict == 0` it is the only thing that
+        # strips a component, so an all-keep mask has to exist for it to act on.
+        if floor > 0:
+            measured = (slot.importance > components.MAX * floor).float()
+            mask = measured if mask is None else mask * measured
+        if mask is not None and not bool(mask.any()):
+            mask = None                       # nothing measured: fall back to TIES
     out = {}
     for name, mod in _adapted(pm):
         if adapter not in mod.lora_A:
             continue
-        d = (mod.lora_B[adapter].weight.float() @ mod.lora_A[adapter].weight.float())
-        d = d * mod.scaling[adapter]
-        out[name] = cfg.delta_scale * ties_truncate(d, cfg.sign_conflict)
+        b = mod.lora_B[adapter].weight.float()
+        a = mod.lora_A[adapter].weight.float()
+        # `dW = sum_i b_i a_i^T`, so the rank axis is summed out and a component
+        # is dropped by zeroing its b row before the product, not by indexing the
+        # result (which is d_out x d_in, not rank columns).
+        if mask is not None and mask.numel() == b.shape[1]:
+            d = (b * mask[None, :]) @ a
+        else:
+            d = ties_truncate(b @ a, cfg.sign_conflict)
+        out[name] = cfg.delta_scale * d * mod.scaling[adapter]
     return out
 
 
@@ -149,7 +176,8 @@ def merge_slot(pm, ladder: Ladder, slot: Slot, buffer: Buffer, cfg: SleepConfig,
         # rest would silently delete the other frozen slots' knowledge.
         sources = [s for s in ladder.live() if s is not slot] + [slot]
         for src in sources:
-            d = compute_deltas(pm, src.name, mcfg)
+            d = compute_deltas(pm, src.name, mcfg, src,
+                               cfg.component_floor if cfg.components else 0.0)
             apply_deltas(pm, d, +1.0)
             applied = True
             for name, t in d.items():

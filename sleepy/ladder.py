@@ -32,6 +32,11 @@ class Slot:
     failures: int = 0
     effective_rank: float = 0.0
     last_gain: float = 0.0
+    # Per-component readouts, 8-bit. `importance` is measured by leave-one-out
+    # and decides what a merge may drop; `plasticity` is the share of the slot's
+    # own gradient each component still takes, and decides what may be refreshed.
+    importance: torch.Tensor | None = None
+    plasticity: torch.Tensor | None = None
 
 
 @dataclass
@@ -143,6 +148,10 @@ def release_slot(pm, ladder: Ladder, slot: Slot) -> None:
     zero_slot(pm, slot)
     slot.state = SlotState.EMPTY
     slot.effective_rank = 0.0
+    # The readouts describe the delta that is gone; a stale vector would be
+    # mistaken for a measurement of the next session's.
+    slot.importance = None
+    slot.plasticity = None
     refresh(pm, ladder)
 
 

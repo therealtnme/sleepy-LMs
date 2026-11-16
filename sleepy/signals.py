@@ -173,6 +173,69 @@ def project_off_basis(grad: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
     return grad - basis @ (basis.T @ grad)
 
 
+def _orthonormal(cols: torch.Tensor) -> torch.Tensor:
+    u, s, _ = torch.linalg.svd(cols, full_matrices=False)
+    return u[:, s > 1e-6 * max(float(s.max()), 1e-12)]
+
+
+def _trim(bases: torch.Tensor) -> torch.Tensor:
+    """Drop trailing zero-pad columns that no row uses.
+
+    Per-row widths differ, so rows are padded to a common width to stay one
+    tensor. Without trimming, a single conflicted component makes every empty row
+    carry a column of zeros, and "empty" reads as non-empty.
+    """
+    live = torch.count_nonzero(bases, dim=1).any(dim=0)   # (width,)
+    return bases[:, :, : int(live.sum())]
+
+
+def component_bases(pm, adapter: str, adapters: list[str], k: int = 4,
+                    overlap: float = 0.5) -> dict[str, torch.Tensor]:
+    """Per-component conflict bases: (rank, d_out, b) for the slot's own B columns.
+
+    A component's output direction is column `b_i`, so only frozen columns that
+    actually *overlap* it can cancel it. Projecting a component against every
+    frozen direction (as the whole-matrix basis does) strips far more than
+    conflicts; projecting it against its own overlapping ones strips exactly the
+    cancellation.
+
+    `overlap` is the cosine below which a frozen column is not considered
+    aligned at all. Returns an empty tensor for components with no conflict.
+    """
+    out = {}
+    for name, mod in adapted_modules(pm):
+        b = getattr(mod, "lora_B", None)
+        if b is None or adapter not in b:
+            continue
+        # B is (d_out, r): component i is column i, so normalize columns and
+        # compare in (r, n) orientation to keep one row per component.
+        own = b[adapter].weight.detach().float().T
+        own = own / own.norm(dim=1, keepdim=True).clamp_min(1e-12)
+        frozen = [b[a].weight.detach().float() for a in adapters if a in b]
+        rank, d_out = own.shape
+        if not frozen:
+            out[name] = own.new_zeros(rank, d_out, 0)
+            continue
+        cols = torch.cat(frozen, dim=1)
+        cols = cols / cols.norm(dim=0, keepdim=True).clamp_min(1e-12)
+        clash = (own @ cols).abs() >= overlap        # (r, n_frozen)
+        bases = []
+        for row in clash:
+            picked = cols[:, row]
+            if picked.shape[1] == 0:
+                bases.append(own.new_zeros(d_out, 0))
+                continue
+            picked = torch.linalg.svd(picked, full_matrices=False)[0][:, :k]
+            # `_orthonormal` keeps only the columns that survived the cap.
+            bases.append(_orthonormal(picked))
+        width = max((x.shape[1] for x in bases), default=0)
+        stacked = own.new_zeros(rank, d_out, width)
+        for i, x in enumerate(bases):
+            stacked[i, :, : x.shape[1]] = x
+        out[name] = _trim(stacked)
+    return out
+
+
 def trapezoid_auc(xs: list[float]) -> float:
     if not xs:
         return float("nan")

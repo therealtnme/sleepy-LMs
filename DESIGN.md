@@ -370,10 +370,20 @@ rescales `p − before`. Zero coefficients are exactly the identity (mult 1, gat
 `2σ(0)` = 1), so a fresh controller changes nothing and every number it reports
 is its own doing.
 
-Learning is one scalar reward — relative loss improvement across the step — with
-one step of lag, so no extra forward is needed. The reward is divided by its
-running mean magnitude; on real data relative loss movement is ~1e-3, which
-against a zero coefficient would otherwise take thousands of steps to matter.
+Learning is one scalar reward — relative loss improvement — and it is measured on
+**one batch against itself**, not across neighbouring batches. The sample change
+between two batches is far larger than anything a coefficient does, so a
+neighbouring batch's loss cannot say whether a coefficient helped. Each step's
+loss is therefore kept, and after the *next* step the same batch is re-forwarded
+and the pair is judged: one extra forward per step, after the step that is being
+judged has already landed (the judged shape is only final once `mult`/`gate` are
+known, so it cannot be the step's own). A sleep the commit gate refuses teaches
+the controller from a batch the model has just thrown away, so `commit` restores
+the pre-sleep coefficients on a refusal and `run` restores them on an exception.
+
+The reward is divided by its running mean magnitude; on real data relative loss
+movement is ~1e-3, which against a zero coefficient would otherwise take
+thousands of steps to matter.
 `I` is probed once per sleep at the halfway point, alongside the rejuvenation,
 rather than per step. Coefficients decay toward neutral (`adapt_decay`) so one a
 measurement stops paying for returns to zero, and they live on the `Ladder` so

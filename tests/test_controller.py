@@ -9,6 +9,7 @@ nothing runs when the feature is off.
 
 from __future__ import annotations
 
+import copy
 import math
 
 import pytest
@@ -17,7 +18,7 @@ import torch
 from sleepy import controller
 from sleepy.ladder import open_slot
 from sleepy.signals import adapted_modules
-from sleepy.sleep import SleepConfig, run
+from sleepy.sleep import SleepConfig, commit, run
 from tests.conftest import StubTokenizer
 
 
@@ -173,6 +174,77 @@ def test_the_controller_persists_across_sleeps(pm, ladder, buffer):
     run(pm, ladder, buffer, ladder.slots[0], _cfg(adapt=True, budget_steps=3))
 
     assert ladder.controller is first
+
+
+def test_the_reward_is_measured_on_one_batch(pm, ladder, buffer, monkeypatch):
+    """Every reward the window learns from is a batch against itself.
+
+    The batches differ by more than a coefficient does, so a retrodiction on a
+    *different* batch cannot say whether the coefficient helped. Here the
+    encoder is pinned so each step's batch is identified by its tokens: the
+    judged batch's ids must equal the ids the loss was taken on.
+    """
+    calls: list[tuple[tuple[int, ...], float | None]] = []   # batch and loss, if any
+    judged: list[tuple[float, float, int]] = []              # (prev, now, index)
+    real_forward = pm.forward
+    real_reward = controller.Controller.reward
+
+    def spy_forward(*a, **kw):
+        out = real_forward(*a, **kw)
+        loss = float(out.loss.detach()) if out.loss is not None else None
+        calls.append((tuple(kw["input_ids"].flatten().tolist()), loss))
+        return out
+
+    def spy_reward(self, prev, now):
+        judged.append((prev, now, len(calls) - 1))
+        return real_reward(self, prev, now)
+
+    monkeypatch.setattr(pm, "forward", spy_forward)
+    monkeypatch.setattr(controller.Controller, "reward", spy_reward)
+    run(pm, ladder, buffer, ladder.slots[2], _cfg(adapt=True, budget_steps=4))
+
+    # Step 0 trains unjudged; each later step trains, then re-forwards the
+    # *previous* step's batch and learns from that batch's before/after pair.
+    # So the "before" must be an earlier forward of the same batch, the "after"
+    # this judged forward, and the pair must not be the current step's batch.
+    assert len(judged) == 3
+    for prev, now, j in judged:
+        batch, loss_now = calls[j]
+        assert now == pytest.approx(loss_now)
+        same = [(n, bid) for bid, n in calls[:j] if bid == batch and n is not None]
+        assert same, "the judged batch was never seen before the step"
+        assert prev == pytest.approx(same[-1][0])       # its loss before the step
+        current = [bid for bid, n in calls[:j] if n is not None][-1]
+        assert current != batch                         # not the judging step's
+
+
+def test_a_rejected_commit_keeps_the_old_coefficients(pm, ladder, buffer):
+    """A sleep the gate throws away must not have moved the controller.
+
+    The refused window's batches are contradicted by the core set the gate
+    measures, so its coefficient moves are wrong evidence and are undone.
+    """
+    ladder.controller = controller.Controller(lr=(0.8, 0.0, 0.0))
+    snap = copy.deepcopy(ladder.controller)
+
+    rep = run(pm, ladder, buffer, ladder.slots[2], _cfg(adapt=True, budget_steps=3))
+    assert rep.ctrl_before is not None and rep.adapt_steps == 3
+    assert ladder.controller.lr != snap.lr            # the window did learn
+    # A KL gate no window can clear, so the commit always refuses.
+    assert not commit(pm, ladder, ladder.slots[2], rep,
+                      _cfg(gate_kl_max=-1.0), float("nan"))
+
+    assert ladder.controller.lr == snap.lr
+    assert ladder.controller.trust == snap.trust
+
+
+def test_a_committed_sleep_keeps_the_learned_coefficients(pm, ladder, buffer):
+    ladder.controller = controller.Controller(lr=(0.8, 0.0, 0.0))
+
+    rep = run(pm, ladder, buffer, ladder.slots[2], _cfg(adapt=True, budget_steps=3))
+    assert commit(pm, ladder, ladder.slots[2], rep, _cfg(), float("nan"))
+
+    assert ladder.controller.lr[0] < 0.8     # decayed toward neutral, not rolled back
 
 
 def test_adapt_leaves_the_committed_delta_finite(pm, ladder, buffer):

@@ -114,6 +114,10 @@ class SleepReport:
     adapt_mult: float = float("nan")
     adapt_gate: float = float("nan")
     adapt_steps: int = 0
+    # Coefficients as they were before this window. `commit` restores them on a
+    # refusal, so a sleep the gate throws away cannot have taught the controller.
+    # Not in `KEYS`: it is a `Controller`, not a number.
+    ctrl_before: object = None
     # Mean pass count over the window. 1 means the depth collapsed to plain
     # fine-tuning, `passes` means every step took the full loop.
     depth: float = float("nan")
@@ -240,10 +244,17 @@ def run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig) -> Sle
     """
     rng = random.Random(cfg.seed)
     open_slot(pm, ladder, slot)
+    # A window the abort cut short taught the coefficients from a partial
+    # signal, so they roll back with everything else.
+    keep = copy.deepcopy(ladder.controller) if cfg.adapt else None
 
     try:
-        return _run(pm, ladder, buffer, slot, cfg, rng)
+        rep = _run(pm, ladder, buffer, slot, cfg, rng)
+        rep.ctrl_before = keep
+        return rep
     except Exception:
+        if cfg.adapt:
+            ladder.controller = keep
         pm.zero_grad(set_to_none=True)
         quarantine_slot(pm, ladder, slot)
         raise
@@ -287,8 +298,9 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
     step, cursor, truncated = 0, 0, False
     rejuvenated, touched = False, 0
     # Adaptive control. `imp` stays zero until the halfway probe supplies a
-    # measurement; `pending` is the previous step's shape, so a step is judged by
-    # the loss movement of the step after it — one step of lag, no extra forward.
+    # measurement; `pending` is the previous step's batch and its pre-step loss,
+    # kept so the step can be judged on its own batch once it has landed — a
+    # neighbouring batch differs by more than any coefficient does.
     ctrl = None
     if cfg.adapt:
         if ladder.controller is None:
@@ -383,12 +395,17 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
             adapt_steps += 1
             mult_sum += float(mult.mean())
             gate_sum += float(gate.mean())
-            # Judge the previous step by how this one's loss moved, then queue
-            # this step's shape to be judged in turn.
+            # Judge the previous step now that it has landed, on that step's own
+            # batch: the loss it started from (its own `batch_loss`) against the
+            # loss now. A batch is only comparable to itself — neighbouring
+            # batches differ by a sample change far larger than anything a
+            # coefficient does, which is what the old lag compared.
             if pending is not None:
-                ctrl.learn(ctrl.reward(pending[0], batch_loss / n_passes),
-                           *pending[1:])
-            pending = (batch_loss / n_passes, weight, share, imp, burst, mult, gate)
+                with torch.no_grad():
+                    now = float(pm(**pending["batch"]).loss)
+                ctrl.learn(ctrl.reward(pending["loss"], now), *pending["shape"])
+            pending = {"batch": batch, "loss": batch_loss / n_passes,
+                       "shape": (weight, share, imp, burst, mult, gate)}
         if (cfg.rejuvenate and not rejuvenated
                 and step + 1 >= int(cfg.budget_steps * cfg.rejuvenate_at)):
             # Halfway through the window: zero the moments of components whose
@@ -465,6 +482,11 @@ def commit(pm, ladder: Ladder, slot: Slot, rep: SleepReport, cfg: SleepConfig,
     if rep.gate_ok:
         freeze_slot(pm, ladder, slot)
     else:
+        # The window's coefficient moves are only evidence about a sleep the
+        # gate accepted; one it refused taught the controller from a batch the
+        # model has now thrown away. Roll back to the pre-sleep coefficients.
+        if rep.ctrl_before is not None:
+            ladder.controller = rep.ctrl_before
         quarantine_slot(pm, ladder, slot)
     return rep.gate_ok
 

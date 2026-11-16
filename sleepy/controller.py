@@ -116,6 +116,9 @@ class Controller:
     def reward(self, prev: float, now: float) -> float:
         r = raw_reward(prev, now)
         self.scale = 0.9 * self.scale + 0.1 * abs(r) if self.scale else abs(r)
+        return self.normalized(r)
+
+    def normalized(self, r: float) -> float:
         if self.scale <= 1e-9:
             return 0.0
         return max(-3.0, min(3.0, r / self.scale))

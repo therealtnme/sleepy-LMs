@@ -448,6 +448,42 @@ together. It is also a *lexical* proxy: two passages on unrelated topics that
 share a stopword score above the floor, and a genuine paraphrase that shares no
 word scores below it.
 
+### 6.6 `[Δ]` What a restart keeps
+
+Everything measured in §6.1-§6.5 — the controller, its reward scale, the
+per-component readouts, the depth guess, each slot's state and failure count —
+used to be discarded on exit while the deltas those measurements had produced
+were kept. The model came back holding the result of a judgement it could no
+longer recall, and bought back the evidence from scratch. The ladder is
+therefore saved and loaded (`sleepy/ladder.py:save` / `load`).
+
+The format is PEFT's own: `save` calls `pm.save_pretrained`, so the weights
+land in the stock per-adapter layout (`<slot>/adapter_config.json` plus
+`adapter_model.safetensors`) and a caller with only `peft` gets them back with
+bare `load_adapter`. Nothing here invents a container for the weights. The
+state with no home in that layout is written after it: each slot's bookkeeping
+as `sleepy.json`, and the two readout vectors as extra tensors in its safetensors
+file — their length is the slot's rank, so the slot is the only object they can
+belong to. PEFT ignores unknown keys, so the file still loads stock; it does
+mean a naive reader sees tensors it did not put there. The controller is
+model-wide, so it is written once beside `s0` and never repeated.
+
+Three rules make load degrade instead of lie:
+
+* A slot directory absent entirely is left as the freshly attached no-op. A
+  partial save is a shorter ladder, not a crash.
+* A readout of the wrong width is skipped, not copied or resized. The file was
+  written by some other code, and a wrong-shaped vector against the slot is
+  worse than none. The bookkeeping JSON is read under the same suppression.
+* Loaded weights make a slot live (`TRAINING`) *before* the metadata is read, so
+  a weights file with no `sleepy.json` beside it restores a usable delta rather
+  than a silent `EMPTY` one.
+
+`load` refills slots in place, so a `Slot` reference held across the call stays
+valid. What it cannot restore is process state outside the ladder: the block
+verdict (§9.2), the buffer's in-memory pool, and any optimizer moments. A
+restart still re-asks the block A/B and reloads the log from tier 0.
+
 ## 7. Replay mix
 
 Order of protection, strongest first:
@@ -673,7 +709,8 @@ one-probe importance sampling, N-pass loop with gradient accumulation, rank
 ladder + handoff, KL/trust-region anchor, merge protocol, per-rank-component
 importance/plasticity readouts feeding the merge, diffusion-block
 training with its matched-step A/B, selective optimizer rejuvenation, adaptive
-plasticity control, adaptive sleep depth, and the full instrumentation table.
+plasticity control, adaptive sleep depth, ladder save/load, and the full
+instrumentation table.
 `python -m sleepy.demo` runs a multi-session scenario with
 a synthetic knowledge stream and prints the signals above so the schedule can be
 watched end to end. Numbers from a 135M CPU run are for *shape* only.

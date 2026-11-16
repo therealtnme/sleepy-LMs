@@ -125,11 +125,14 @@ python -m sleepy.demo --model HuggingFaceTB/SmolLM2-135M --blocks on   # measure
 | file | contents |
 | --- | --- |
 | `sleepy/buffer.py` | tier 0 append-only store, reservoir eviction, undeletable core set |
-| `sleepy/ladder.py` | slot states and the rank ladder; `attach`/`refresh` lifecycle |
+| `sleepy/ladder.py` | slot states and the rank ladder; `attach`/`refresh` lifecycle and `save`/`load` |
 | `sleepy/sleep.py` | tier 1 sleep: importance select → N passes → one step → gate |
 | `sleepy/merge.py` | tier 2 atomic merge with TIES truncation, and the tier-1 handoff |
 | `sleepy/blocks.py` | diffusion-block training and the matched-step A/B that gates it |
 | `sleepy/signals.py` | KL guard, trust region, effective rank, dormant-unit readout |
+| `sleepy/components.py` | per-component importance/plasticity readouts and the prune they feed |
+| `sleepy/controller.py` | six learned coefficients: per-component LR multiplier and trust gate |
+| `sleepy/optimizer.py` | selective Adam-moment rejuvenation, mask along the rank axis |
 | `sleepy/probe.py` | throwaway-copy plasticity exam |
 | `sleepy/quiet.py` | learned low-traffic window, with abstention until calibrated |
 | `sleepy/orchestrator.py` | schedule, history, and the sleep/handoff/merge loop |

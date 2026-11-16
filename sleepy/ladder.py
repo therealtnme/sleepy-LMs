@@ -8,11 +8,15 @@ adapter is ever trained twice.
 
 from __future__ import annotations
 
+import json
+from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 
 import torch
 from peft import LoraConfig, get_peft_model
+from safetensors.torch import load_file, save_file
 
 RANKS = (1, 1, 2, 4, 8, 16, 32, 64)
 
@@ -101,6 +105,92 @@ class Ladder:
 
     def exhausted(self) -> bool:
         return self.lowest_empty() is None
+
+
+# -- persistence -----------------------------------------------------------
+# A restart rebuilt every slot empty, so a learned controller, its reward scale
+# and every component readout were thrown away while the model kept the deltas
+# those measurements had produced. The ladder therefore saves beside the
+# adapters: each slot gets a `sleepy.json` of its own bookkeeping, and the
+# readouts ride in its `adapter_model.safetensors` because their length is the
+# slot's rank. The controller is one model-wide object, so it lives with `s0`.
+_CONTROL = "s0"
+
+
+def save(pm, ladder: Ladder, out: Path) -> None:
+    """Both ways of getting the ladder back: attach it, or recover the state.
+
+    `pm.save_pretrained` is PEFT's own per-adapter layout, so the result loads
+    with stock `load_adapter` — this module does not invent a format for the
+    weights. The state that has no home in that layout is written after it.
+    """
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    pm.save_pretrained(out)
+    for slot in ladder.slots:
+        imp = slot.importance
+        if imp is not None:
+            f = out / slot.name / "adapter_model.safetensors"
+            sd = load_file(f)
+            sd["sleepy.importance"] = imp.detach().cpu().contiguous()
+            if slot.plasticity is not None:
+                sd["sleepy.plasticity"] = slot.plasticity.detach().cpu().contiguous()
+            save_file(sd, f)
+        (out / slot.name / "sleepy.json").write_text(json.dumps(
+            {"state": slot.state.value, "failures": slot.failures,
+             "effective_rank": slot.effective_rank, "last_gain": slot.last_gain}),
+            encoding="utf-8")
+    ctrl = ladder.controller
+    (out / _CONTROL / "sleepy.control.json").write_text(json.dumps(
+        {"alpha_mult": ladder.alpha_mult, "sleep_depth": ladder.sleep_depth,
+         "controller": None if ctrl is None else {
+             "lr": list(ctrl.lr), "trust": list(ctrl.trust),
+             "eta": ctrl.eta, "decay": ctrl.decay, "scale": ctrl.scale}},
+        ), encoding="utf-8")
+
+
+def load(pm, ladder: Ladder, src: Path) -> None:
+    """Refill every slot in place, so held slot references stay valid.
+
+    A control dictionary absent or of the wrong rank is skipped rather than
+    resized: the file was written by some other code, and a wrong-width vector
+    against a slot is worse than a missing one. A slot directory missing
+    entirely is left as the freshly attached no-op.
+    """
+    src = Path(src)
+    for slot in ladder.slots:
+        d = src / slot.name
+        if not (d / "adapter_model.safetensors").exists():
+            continue
+        pm.load_adapter(str(d), adapter_name=slot.name)
+        sd = load_file(d / "adapter_model.safetensors")
+        for key, attr in (("sleepy.importance", "importance"),
+                          ("sleepy.plasticity", "plasticity")):
+            t = sd.get(key)
+            if t is not None and t.numel() == slot.rank:
+                setattr(slot, attr, t.to(torch.uint8))
+        slot.state = SlotState.TRAINING      # loaded weights are as live as they get
+        with suppress(OSError, ValueError, KeyError):
+            meta = json.loads((d / "sleepy.json").read_text(encoding="utf-8"))
+            slot.state = SlotState(meta["state"])
+            slot.failures = int(meta["failures"])
+            slot.effective_rank = float(meta["effective_rank"])
+            slot.last_gain = float(meta["last_gain"])
+    with suppress(OSError, ValueError, KeyError):
+        meta = json.loads((src / _CONTROL / "sleepy.control.json")
+                          .read_text(encoding="utf-8"))
+        ladder.alpha_mult = float(meta["alpha_mult"])
+        dep = meta.get("sleep_depth")
+        ladder.sleep_depth = None if dep is None else int(dep)
+        c = meta.get("controller")
+        if c:
+            # The controller module imports nothing from here, so this is acyclic.
+            from .controller import Controller
+
+            ladder.controller = Controller(tuple(c["lr"]), tuple(c["trust"]),
+                                           float(c["eta"]), float(c["decay"]),
+                                           float(c["scale"]))
+    refresh(pm, ladder)
 
 
 install_slots = None  # bound below, kept as a name for callers that import eagerly

@@ -46,6 +46,10 @@ class Ladder:
     modules: list[str]
     alpha_mult: float = 1.0
     slots: list[Slot] = field(default_factory=list)
+    # Six coefficients that persist across sleeps; None until adaptive control
+    # is switched on, and kept when it is switched off again so turning it back
+    # on resumes from the learned state rather than from neutral.
+    controller: object | None = None
 
     @classmethod
     def build(cls, modules: list[str], ranks: tuple[int, ...] = RANKS,

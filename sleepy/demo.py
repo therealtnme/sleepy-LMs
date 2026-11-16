@@ -106,6 +106,9 @@ def main() -> None:
     ap.add_argument("--blocks", choices=("on", "off"), default="off",
                     help="periodically A/B diffusion-block training against end-to-end "
                          "and adopt the split only if it wins; costs two extra runs a cycle")
+    ap.add_argument("--adapt", choices=("on", "off"), default="off",
+                    help="adaptive plasticity control: learned per-component LR and "
+                         "trust gate; can hurt while it learns, so off by default")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -132,7 +135,8 @@ def main() -> None:
     buffer.bank_core(core)
 
     cfg = SleepConfig(tokenizer=tok, seq_len=args.seq_len, passes=args.passes,
-                      budget_steps=args.budget, seed=args.seed)
+                      budget_steps=args.budget, seed=args.seed,
+                      adapt=args.adapt == "on")
     sched = Schedule(min_items=args.min_items, max_items=CAPACITY, min_hours=0.0,
                      merge_after_slots=3, stall_window=2)
     mcfg = MergeConfig(inner_steps=12, gate_kl_max=0.25)
@@ -156,11 +160,13 @@ def main() -> None:
         return (f"{str(row.get('event', '')):<9}{str(row.get('slot', '')):<6}"
                 f"{num(row, 'rank', 'd', 4)} {num(row, 'kl_commit', '.3f', 7)} "
                 f"{num(row, 'core_loss', '.3f', 7)} {num(row, 'delta_ratio', '.2e', 8)} "
+                f"{num(row, 'adapt_mult', '.3f', 6)} "
                 f"{'' if gate is None else str(gate):>6}  "
                 f"{row.get('reason', row.get('note', ''))}")
 
     print(f"workdir {workdir}")
-    print(f"{'ev':<9}{'slot':<6}{'rank':>4} {'kl':>7} {'core':>7} {'drank':>8} {'gate':>6}  reason")
+    print(f"{'ev':<9}{'slot':<6}{'rank':>4} {'kl':>7} {'core':>7} {'drank':>8} {'amult':>6} "
+          f"{'gate':>6}  reason")
     for session in range(1, args.sessions + 1):
         # A session lands mid-afternoon; the sleep it triggers waits for the
         # small hours, so the clock jumps forward to meet the learned window.

@@ -338,6 +338,43 @@ its place only on long windows where an early spike would otherwise suppress a
 component for the whole run. Both the readout accumulation and the reset are
 gated so they cost nothing when off; `rejuvenated` is reported per sleep.
 
+### 6.3 Adaptive plasticity control
+
+The readouts of §6.1 exist to be acted on. Rejuvenation (§6.2) is the crude
+form: reset a component's history. Controller `sleepy/controller.py` is the
+continuous form — six float32 coefficients that shape every step:
+
+```
+mult_i = clip(exp(a0 + a1·W_i + a2·S_i), 0.25, 2)      # per-component LR
+gate_i = 2·σ(b0 + b1·I_i + b2·G_i)                     # per-component trust
+```
+
+`W` is the component's share of the slot's output magnitude (weight growth — a
+grown component is effectively shrunk by LayerNorm), `S` its share of the window
+gradient (§6.1 plasticity), `I` its measured importance, `G` how far this step's
+gradient exceeds the component's own history (a burst, not a level).
+
+**The gate lands on the optimizer's proposed update, not the gradient.** AdamW
+divides by the gradient's own magnitude, so a gradient-side gate is very nearly
+a no-op; every adapted parameter is snapshotted before `opt.step()` and the gate
+rescales `p − before`. Zero coefficients are exactly the identity (mult 1, gate
+`2σ(0)` = 1), so a fresh controller changes nothing and every number it reports
+is its own doing.
+
+Learning is one scalar reward — relative loss improvement across the step — with
+one step of lag, so no extra forward is needed. The reward is divided by its
+running mean magnitude; on real data relative loss movement is ~1e-3, which
+against a zero coefficient would otherwise take thousands of steps to matter.
+`I` is probed once per sleep at the halfway point, alongside the rejuvenation,
+rather than per step. Coefficients decay toward neutral (`adapt_decay`) so one a
+measurement stops paying for returns to zero, and they live on the `Ladder` so
+they persist across sleeps and across slots.
+
+**Off by default.** Unlike the readouts, this can make a step worse while it is
+learning, so it earns its place by measurement first. `adapt_mult`,
+`adapt_gate` and `adapt_steps` are reported per sleep; the first two near 1.0
+mean the controller ran and declined to do anything.
+
 ## 7. Replay mix
 
 Order of protection, strongest first:
@@ -550,8 +587,8 @@ Resolved, with the evidence that closed each one:
 one-probe importance sampling, N-pass loop with gradient accumulation, rank
 ladder + handoff, KL/trust-region anchor, merge protocol, per-rank-component
 importance/plasticity readouts feeding the merge, diffusion-block
-training with its matched-step A/B, selective optimizer rejuvenation, and the
-full instrumentation table.
+training with its matched-step A/B, selective optimizer rejuvenation, adaptive
+plasticity control, and the full instrumentation table.
 `python -m sleepy.demo` runs a multi-session scenario with
 a synthetic knowledge stream and prints the signals above so the schedule can be
 watched end to end. Numbers from a 135M CPU run are for *shape* only.

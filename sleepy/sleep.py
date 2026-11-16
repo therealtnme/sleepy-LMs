@@ -14,7 +14,7 @@ from pathlib import Path
 
 import torch
 
-from . import components, optimizer, signals
+from . import components, controller, optimizer, signals
 from .buffer import Buffer, Item, render
 from .ladder import Ladder, Slot, freeze_slot, open_slot, quarantine_slot
 
@@ -63,6 +63,14 @@ class SleepConfig:
     rejuvenate: bool = False
     rejuvenate_share: float = 0.01
     rejuvenate_at: float = 0.5
+    # Adaptive Plasticity Control: six learned coefficients set a per-component
+    # LR multiplier and a trust gate on the optimizer's proposed update. Off by
+    # default — it is the one knob here that can make a step *worse* while it
+    # learns, so it has to earn its place by measurement first. The coefficients
+    # live on the ladder and are the ladder's, not this config's.
+    adapt: bool = False
+    adapt_lr: float = 0.02           # learning rate for the coefficients
+    adapt_decay: float = 0.02        # pull back to neutral (mult 1, gate 1)
 
 
 @dataclass
@@ -84,12 +92,18 @@ class SleepReport:
     comp_moving: float = float("nan")
     # Moment tensors zeroed by a selective rejuvenation (0 when off or skipped).
     rejuvenated: int = 0
+    # Mean multiplier and gate the adaptive controller applied over the window,
+    # and the steps it touched. 1.0/1.0 means it ran and did nothing.
+    adapt_mult: float = float("nan")
+    adapt_gate: float = float("nan")
+    adapt_steps: int = 0
     gate_ok: bool = False
     reason: str = ""
 
     KEYS = ("slot", "rank", "steps", "truncated", "loss_first", "loss_last",
             "kl_commit", "core_loss", "delta_ratio", "eff_rank", "comp_live",
-            "comp_moving", "rejuvenated", "gate_ok", "reason")
+            "comp_moving", "rejuvenated", "adapt_mult", "adapt_gate",
+            "adapt_steps", "gate_ok", "reason")
 
     def row(self) -> dict:
         return {k: getattr(self, k) for k in self.KEYS}
@@ -215,6 +229,19 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
     losses: list[float] = []
     step, cursor, truncated = 0, 0, False
     rejuvenated, touched = False, 0
+    # Adaptive control. `imp` stays zero until the halfway probe supplies a
+    # measurement; `pending` is the previous step's shape, so a step is judged by
+    # the loss movement of the step after it — one step of lag, no extra forward.
+    ctrl = None
+    if cfg.adapt:
+        if ladder.controller is None:
+            ladder.controller = controller.Controller(eta=cfg.adapt_lr,
+                                                      decay=cfg.adapt_decay)
+        ctrl = ladder.controller
+        ctrl.eta, ctrl.decay = cfg.adapt_lr, cfg.adapt_decay
+    imp = torch.zeros(slot.rank)
+    pending = None
+    adapt_steps, mult_sum, gate_sum = 0, 0.0, 0.0
     # A split fixes each step's depth block up front and cycles them, so every
     # block gets an equal share of the budget instead of the tail getting none.
     span = None
@@ -253,10 +280,27 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
             batch_loss += float(lm_loss.detach())
         torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
         project(pm, slot.name, cfg, occupied)
-        if cfg.components or cfg.rejuvenate:
+        if cfg.components or cfg.rejuvenate or ctrl is not None:
             components.accumulate(energy, components.gradient_energy(pm, slot.name))
+        before = None
+        if ctrl is not None:
+            weight, share, burst = controller.features(
+                pm, slot.name, slot.rank, energy.get("grad"))
+            mult, gate = ctrl.weights(weight, share, imp, burst)
+            before = controller.snapshot(pm, slot.name)
         opt.step()
         opt.zero_grad(set_to_none=True)
+        if ctrl is not None:
+            controller.apply(pm, slot.name, before, mult, gate)
+            adapt_steps += 1
+            mult_sum += float(mult.mean())
+            gate_sum += float(gate.mean())
+            # Judge the previous step by how this one's loss moved, then queue
+            # this step's shape to be judged in turn.
+            if pending is not None:
+                ctrl.learn(ctrl.reward(pending[0], batch_loss / cfg.passes),
+                           *pending[1:])
+            pending = (batch_loss / cfg.passes, weight, share, imp, burst, mult, gate)
         if (cfg.rejuvenate and not rejuvenated
                 and step + 1 >= int(cfg.budget_steps * cfg.rejuvenate_at)):
             # Halfway through the window: zero the moments of components whose
@@ -265,6 +309,17 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
             mask = components.shares(energy, slot.rank) < cfg.rejuvenate_share
             touched += optimizer.rejuvenate(opt, pm, slot.name, mask)
             rejuvenated = True
+        if (ctrl is not None and items and float(imp.max()) == 0
+                and step + 1 >= int(cfg.budget_steps * cfg.rejuvenate_at)):
+            # One probe for the whole run, at the halfway point alongside the
+            # rejuvenation: the gate needs a measurement of what the model
+            # actually needs, and one forward per component per step is too
+            # expensive for every step.
+            fresh = components.measure(pm, slot.name,
+                                       encode(cfg, render(items[: cfg.batch_items])),
+                                       cfg.component_probes, cfg.component_pairs)
+            if fresh is not None and fresh.numel() == slot.rank:
+                imp = fresh.float() / components.MAX
         losses.append(batch_loss / cfg.passes)
         step += 1
         if not all(torch.isfinite(torch.tensor(x)) for x in losses[-1:]):
@@ -300,7 +355,9 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
         comp_live=components.live_fraction(slot.importance),
         comp_moving=(float((slot.plasticity > 0).float().mean())
                      if slot.plasticity is not None else float("nan")),
-        rejuvenated=touched)
+        rejuvenated=touched, adapt_mult=mult_sum / adapt_steps if adapt_steps else float("nan"),
+        adapt_gate=gate_sum / adapt_steps if adapt_steps else float("nan"),
+        adapt_steps=adapt_steps)
 
 
 def commit(pm, ladder: Ladder, slot: Slot, rep: SleepReport, cfg: SleepConfig,

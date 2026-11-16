@@ -32,7 +32,13 @@ from .sleep import SleepConfig, SleepReport, batches_of, core_loss, encode, kl_t
 @dataclass
 class MergeConfig:
     delta_scale: float = 0.7        # s < 1: the adapter overweights the recent past
-    sign_conflict: float = 0.5      # TIES truncation mass
+    # Element-wise TIES truncation mass, applied to every module's delta. How
+    # much of the *element tail* is zeroed and how much of the *rank* is pruned
+    # are separate decisions; this one is the tail.
+    sign_conflict: float = 0.5
+    # Share of the rank dropped whole, lowest measured importance first. 0
+    # keeps every measured component and leaves only `sign_conflict` to act.
+    component_drop_fraction: float = 0.0
     inner_steps: int = 30
     inner_lr: float = 5e-5
     gate_kl_max: float = 0.10
@@ -61,28 +67,40 @@ def ties_truncate(delta: torch.Tensor, conflict: float) -> torch.Tensor:
     return torch.where(delta.abs() >= thresh, delta, torch.zeros_like(delta))
 
 
+def _component_mask(slot: Slot | None, cfg: MergeConfig,
+                    floor: float, rank: int) -> torch.Tensor | None:
+    """Per-component 1/0 over `rank`, or None when no readout applies.
+
+    Two independent prunes, both from the measured importance: the `floor`
+    strips a component that never scored, and `component_drop_fraction` drops
+    the lowest-scored share. They are prunes of the *rank*, not of the element
+    magnitudes, so the TIES truncation still runs on what survives.
+    """
+    if slot is None or slot.importance is None:
+        return None
+    if slot.importance.numel() != rank:
+        return None
+    mask = components.keep_mask(slot.importance, cfg.component_drop_fraction)
+    if floor > 0:
+        measured = (slot.importance > components.MAX * floor).float()
+        mask = measured if mask is None else mask * measured
+    if mask is not None and not bool(mask.any()):
+        return None                           # nothing measured: keep the rank
+    return mask
+
+
 def compute_deltas(pm, adapter: str, cfg: MergeConfig,
                    slot: Slot | None = None,
                    floor: float = 0.0) -> dict[str, torch.Tensor]:
-    """dW for every adapted module: s * truncate(delta). Does not apply.
+    """dW for every adapted module: s * truncate(pruned delta). Does not apply.
 
     Measured importance, when the slot carries it, drops whole rank components
     ahead of the magnitude threshold: a component nothing depends on is exactly
     what a magnitude threshold keeps, because it is usually a large early one.
-    `floor` first strips components that never scored, keeping `sign_conflict`
-    as the truncation mass either way.
+    The TIES truncation (`sign_conflict`) then runs element-wise on the pruned
+    delta — a kept component still has a small-magnitude tail, and the two
+    judgements are independent.
     """
-    mask = None
-    if slot is not None and slot.importance is not None:
-        mask = components.keep_mask(slot.importance, cfg.sign_conflict)
-        # `keep_mask` returns None when nothing would be dropped, but the floor
-        # still applies then: at `sign_conflict == 0` it is the only thing that
-        # strips a component, so an all-keep mask has to exist for it to act on.
-        if floor > 0:
-            measured = (slot.importance > components.MAX * floor).float()
-            mask = measured if mask is None else mask * measured
-        if mask is not None and not bool(mask.any()):
-            mask = None                       # nothing measured: fall back to TIES
     out = {}
     for name, mod in _adapted(pm):
         if adapter not in mod.lora_A:
@@ -92,11 +110,10 @@ def compute_deltas(pm, adapter: str, cfg: MergeConfig,
         # `dW = sum_i b_i a_i^T`, so the rank axis is summed out and a component
         # is dropped by zeroing its b row before the product, not by indexing the
         # result (which is d_out x d_in, not rank columns).
-        if mask is not None and mask.numel() == b.shape[1]:
-            d = (b * mask[None, :]) @ a
-        else:
-            d = ties_truncate(b @ a, cfg.sign_conflict)
-        out[name] = cfg.delta_scale * d * mod.scaling[adapter]
+        mask = _component_mask(slot, cfg, floor, b.shape[1])
+        d = (b * mask[None, :]) @ a if mask is not None else b @ a
+        out[name] = cfg.delta_scale * ties_truncate(d, cfg.sign_conflict) \
+            * mod.scaling[adapter]
     return out
 
 

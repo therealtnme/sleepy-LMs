@@ -120,16 +120,19 @@ def smooth(prev: torch.Tensor, new: torch.Tensor, alpha: float) -> torch.Tensor:
     return mixed.round().clamp(0, MAX).to(torch.uint8)
 
 
-def keep_mask(importance: torch.Tensor, conflict: float) -> torch.Tensor | None:
-    """1.0 for the components to keep, 0.0 for the `conflict` lowest-scored ones.
+def keep_mask(importance: torch.Tensor, drop: float) -> torch.Tensor | None:
+    """1.0 for the components to keep, 0.0 for the `drop` lowest-scored ones.
 
-    Rank-relative rather than absolute, mirroring TIES' truncation *mass*: the
-    same knob means the same share of the update at every rank.
+    Rank-relative rather than absolute: the same knob means the same share of
+    the rank at every rank. Independent of TIES' truncation mass — a component
+    can be worth less than another and still hold knowledge, so how much of the
+    rank is pruned and how much of each element-wise delta is truncated are two
+    different decisions.
     """
-    if conflict <= 0:
+    if drop <= 0:
         return None
     r = importance.numel()
-    keep = max(1, int(round(r * (1.0 - conflict))))
+    keep = max(1, int(round(r * (1.0 - drop))))
     if r == 0 or keep >= r:
         return None
     order = torch.argsort(importance, descending=True, stable=True)

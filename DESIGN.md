@@ -309,12 +309,21 @@ Two corrections to leave-one-out, both implemented:
   only the probe can overturn it, and only where it is wrong.
 
 **Where the readout changes a decision.** A readout that no gate consumes is
-telemetry. This one is consumed at merge (§5.2 step 3): `compute_deltas` drops the
-`sign_conflict` lowest-scored components *before* the magnitude threshold, and
-`component_floor` additionally strips components that never scored above
-`floor · sign_conflict`. Both exist because magnitude keeps exactly the wrong
+telemetry. This one is consumed at merge (§5.2 step 3) as a *prune of the rank*:
+`compute_deltas` zeroes whole components before the magnitude threshold, the
+`component_drop_fraction` lowest-scored share, plus anything below the absolute
+`component_floor`. Both exist because magnitude keeps exactly the wrong
 component — a large component that carries nothing is a big early direction,
 precisely what a threshold retains. The second consumer is §6.2.
+
+**Pruning and truncation are two decisions.** TIES truncation (§5.2) zeroes the
+small-magnitude *elements* of a delta; component pruning zeroes whole *rank
+directions*. A first draft ran one knob for both, which meant a TIES default of
+0.5 silently threw away half the rank as well as half the element tail. The two
+are now independent: `sign_conflict` is the element tail, `component_drop_fraction`
+is the rank and starts at **0.0**, so the default is the pre-existing TIES
+behaviour and the prune only happens when turned on. Truncation always runs on
+what survives the prune — a kept component still has a small tail.
 
 ### 6.2 Selective optimizer rejuvenation
 

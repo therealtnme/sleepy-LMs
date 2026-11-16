@@ -101,6 +101,7 @@ def test_keep_mask_drops_the_lowest_scores():
 def test_keep_mask_never_drops_the_whole_slot():
     assert components.keep_mask(torch.zeros(4, dtype=torch.uint8), 0.5).sum() == 2
     assert components.keep_mask(torch.zeros(4, dtype=torch.uint8), 0.0) is None
+    assert components.keep_mask(torch.zeros(2, dtype=torch.uint8), 1.0).sum() == 1
 
 
 def test_smooth_weights_the_new_readout():
@@ -132,7 +133,10 @@ def test_merge_drops_components_importance_says_are_dead(pm, ladder):
             mod.lora_B["s9"].weight[:, 0].fill_(0.01)   # small but needed
             mod.lora_B["s9"].weight[:, 1].fill_(10.0)   # huge but dead
 
-    deltas = compute_deltas(pm, "s9", MergeConfig(sign_conflict=0.5), slot, 0.0)
+    # TIES off, so anything dropped here was dropped by importance alone.
+    deltas = compute_deltas(pm, "s9", MergeConfig(sign_conflict=0.0,
+                                                 component_drop_fraction=0.5),
+                            slot, 0.0)
 
     assert deltas
     for name, mod in adapted_modules(pm):
@@ -141,6 +145,54 @@ def test_merge_drops_components_importance_says_are_dead(pm, ladder):
         # Component 1 (column 1 of B) is dropped, so only component 0 survives.
         expected = b[:, 0:1] @ a[0:1] * mod.scaling["s9"] * 0.7
         assert torch.allclose(deltas[name], expected, atol=1e-6)
+
+
+def test_truncation_is_independent_of_pruning(pm, ladder):
+    """A kept component still gets its own element tail truncated.
+
+    With `component_drop_fraction=0` every component survives the prune, and the
+    result must still differ from the raw product: the TIES mass acts on the
+    elements, untouched by how much of the rank was pruned.
+    """
+    slot = _fake_slot(pm, ladder, [255, 255])
+    with torch.no_grad():
+        for _, mod in adapted_modules(pm):
+            mod.lora_A["s9"].weight.fill_(1.0)
+            # A spread of magnitudes, so "the smallest half" is a real subset.
+            b = mod.lora_B["s9"].weight
+            b.copy_(torch.arange(1, b.numel() + 1, dtype=b.dtype).reshape(b.shape))
+
+    pruned_only = compute_deltas(pm, "s9", MergeConfig(sign_conflict=0.0,
+                                                       component_drop_fraction=0.0,
+                                                       delta_scale=1.0), slot, 0.0)
+    truncated = compute_deltas(pm, "s9", MergeConfig(sign_conflict=0.5,
+                                                     component_drop_fraction=0.0,
+                                                     delta_scale=1.0), slot, 0.0)
+
+    kept = 0
+    for name, _mod in adapted_modules(pm):
+        # Both components land in the pruned version...
+        assert torch.count_nonzero(pruned_only[name]) > 0
+        kept += 1
+        # ...and the truncation still zeroes the small tail of what survived.
+        assert torch.count_nonzero(truncated[name]) > 0
+        assert torch.count_nonzero(truncated[name]) < torch.count_nonzero(pruned_only[name])
+    assert kept
+
+
+def test_a_prune_that_would_empty_the_slot_falls_back_to_the_rank(pm, ladder):
+    slot = _fake_slot(pm, ladder, [0, 0])
+
+    deltas = compute_deltas(pm, "s9", MergeConfig(sign_conflict=0.0,
+                                                  component_drop_fraction=0.5),
+                            slot, 0.5)          # the floor strips both
+
+    assert deltas
+    for name, mod in adapted_modules(pm):
+        b = mod.lora_B["s9"].weight.float()
+        a = mod.lora_A["s9"].weight.float()
+        assert torch.allclose(deltas[name], (b @ a) * mod.scaling["s9"] * 0.7,
+                              atol=1e-6)
 
 
 def test_component_floor_drops_unmeasured_components(pm, ladder):

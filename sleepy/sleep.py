@@ -51,9 +51,10 @@ class SleepConfig:
     component_probes: int = 8        # components tested per sleep, most energetic first
     component_pairs: int = 3         # pairwise re-probes for redundancy (see components)
     component_alpha: float = 0.5     # EMA weight of the newest importance readout
-    # Components below this share of `sign_conflict` carry no measurable importance
-    # at every measurement and are dropped at merge, so a magnitude threshold does
-    # not keep what nothing needs. 0 disables it.
+    # Components whose smoothed importance never rose above this share of the
+    # scale are dropped at merge, so a magnitude threshold does not keep what
+    # nothing needs. Separate from TIES: this is an absolute rank prune, the
+    # `MergeConfig.component_drop_fraction` a rank-relative one. 0 disables it.
     component_floor: float = 0.5
     # Selective optimizer rejuvenation. Off by default: Paper 1 measured stale
     # Adam moments are not the cause of plasticity loss, so a reset has no

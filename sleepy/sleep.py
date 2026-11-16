@@ -14,7 +14,7 @@ from pathlib import Path
 
 import torch
 
-from . import components, signals
+from . import components, optimizer, signals
 from .buffer import Buffer, Item, render
 from .ladder import Ladder, Slot, freeze_slot, open_slot, quarantine_slot
 
@@ -55,6 +55,14 @@ class SleepConfig:
     # at every measurement and are dropped at merge, so a magnitude threshold does
     # not keep what nothing needs. 0 disables it.
     component_floor: float = 0.5
+    # Selective optimizer rejuvenation. Off by default: Paper 1 measured stale
+    # Adam moments are not the cause of plasticity loss, so a reset has no
+    # demonstrated default benefit. On, the components whose share of the window's
+    # gradient fell below `rejuvenate_share` have their moments zeroed halfway
+    # through the budget, re-arming them for the second half.
+    rejuvenate: bool = False
+    rejuvenate_share: float = 0.01
+    rejuvenate_at: float = 0.5
 
 
 @dataclass
@@ -74,12 +82,14 @@ class SleepReport:
     # moves, which is the plasticity loss the ladder exists to avoid.
     comp_live: float = float("nan")
     comp_moving: float = float("nan")
+    # Moment tensors zeroed by a selective rejuvenation (0 when off or skipped).
+    rejuvenated: int = 0
     gate_ok: bool = False
     reason: str = ""
 
     KEYS = ("slot", "rank", "steps", "truncated", "loss_first", "loss_last",
             "kl_commit", "core_loss", "delta_ratio", "eff_rank", "comp_live",
-            "comp_moving", "gate_ok", "reason")
+            "comp_moving", "rejuvenated", "gate_ok", "reason")
 
     def row(self) -> dict:
         return {k: getattr(self, k) for k in self.KEYS}
@@ -204,6 +214,7 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
 
     losses: list[float] = []
     step, cursor, truncated = 0, 0, False
+    rejuvenated, touched = False, 0
     # A split fixes each step's depth block up front and cycles them, so every
     # block gets an equal share of the budget instead of the tail getting none.
     span = None
@@ -242,10 +253,18 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
             batch_loss += float(lm_loss.detach())
         torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
         project(pm, slot.name, cfg, occupied)
-        if cfg.components:
+        if cfg.components or cfg.rejuvenate:
             components.accumulate(energy, components.gradient_energy(pm, slot.name))
         opt.step()
         opt.zero_grad(set_to_none=True)
+        if (cfg.rejuvenate and not rejuvenated
+                and step + 1 >= int(cfg.budget_steps * cfg.rejuvenate_at)):
+            # Halfway through the window: zero the moments of components whose
+            # share of the gradient so far is negligible, so an early spike
+            # cannot suppress them for the rest of the run.
+            mask = components.shares(energy, slot.rank) < cfg.rejuvenate_share
+            touched += optimizer.rejuvenate(opt, pm, slot.name, mask)
+            rejuvenated = True
         losses.append(batch_loss / cfg.passes)
         step += 1
         if not all(torch.isfinite(torch.tensor(x)) for x in losses[-1:]):
@@ -280,7 +299,8 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
         delta_ratio=worst, eff_rank=slot.effective_rank,
         comp_live=components.live_fraction(slot.importance),
         comp_moving=(float((slot.plasticity > 0).float().mean())
-                     if slot.plasticity is not None else float("nan")))
+                     if slot.plasticity is not None else float("nan")),
+        rejuvenated=touched)
 
 
 def commit(pm, ladder: Ladder, slot: Slot, rep: SleepReport, cfg: SleepConfig,

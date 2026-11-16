@@ -314,9 +314,29 @@ telemetry. This one is consumed at merge (§5.2 step 3): `compute_deltas` drops 
 `component_floor` additionally strips components that never scored above
 `floor · sign_conflict`. Both exist because magnitude keeps exactly the wrong
 component — a large component that carries nothing is a big early direction,
-precisely what a threshold retains. Replacing a component with a fresh one is
-what `plasticity` decides, and it is the readout item 3 (optimizer rejuvenation)
-builds on.
+precisely what a threshold retains. The second consumer is §6.2.
+
+### 6.2 Selective optimizer rejuvenation
+
+Adam's second moment decays with a half-life of ~`1/(1 − β₂)` steps, which
+outlives a whole sleep window. A component that spiked at step 2 therefore keeps
+a large `exp_avg_sq` for the rest of the run and every later gradient on it is
+normalized down — including fresh signal. Zeroing the moments of exactly the
+components that went quiet re-arms them; every other component keeps its history.
+
+`sleepy/optimizer.py:rejuvenate` masks `exp_avg`/`exp_avg_sq` along the rank axis
+(axis 0 of `A` `(rank, d_in)`, axis 1 of `B` `(d_out, rank)` — names disambiguate,
+a square layer would not). The trigger is the `plasticity` share readout, not
+importance: a component that took no share of the window's own gradient is the
+one whose stored moments describe gradients that are gone. Parameters with no
+optimizer state are skipped, not initialized. `rejuvenate_at` fires it once,
+halfway through the budget.
+
+**Off by default.** Paper 1 measured that stale Adam moments are *not* the cause
+of plasticity loss, so the reset has no demonstrated default benefit — it earns
+its place only on long windows where an early spike would otherwise suppress a
+component for the whole run. Both the readout accumulation and the reset are
+gated so they cost nothing when off; `rejuvenated` is reported per sleep.
 
 ## 7. Replay mix
 
@@ -530,7 +550,8 @@ Resolved, with the evidence that closed each one:
 one-probe importance sampling, N-pass loop with gradient accumulation, rank
 ladder + handoff, KL/trust-region anchor, merge protocol, per-rank-component
 importance/plasticity readouts feeding the merge, diffusion-block
-training with its matched-step A/B, and the full instrumentation table.
+training with its matched-step A/B, selective optimizer rejuvenation, and the
+full instrumentation table.
 `python -m sleepy.demo` runs a multi-session scenario with
 a synthetic knowledge stream and prints the signals above so the schedule can be
 watched end to end. Numbers from a 135M CPU run are for *shape* only.

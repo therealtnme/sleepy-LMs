@@ -13,6 +13,9 @@ absolute value.
 Sessions are stamped onto a simulated clock — daytime contact, small-hours
 sleeps — so the learned quiet window has something to learn. `--quiet off`
 restores the fixed quiet period.
+
+`--blocks on` additionally measures every tenth sleep whether training one depth
+block at a time beats training the whole model, and only then switches.
 """
 
 from __future__ import annotations
@@ -100,6 +103,9 @@ def main() -> None:
     ap.add_argument("--workdir", default=None)
     ap.add_argument("--quiet", choices=("on", "off"), default="on",
                     help="learned quiet window; 'off' uses the fixed quiet period")
+    ap.add_argument("--blocks", choices=("on", "off"), default="off",
+                    help="periodically A/B diffusion-block training against end-to-end "
+                         "and adopt the split only if it wins; costs two extra runs a cycle")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -135,7 +141,8 @@ def main() -> None:
     sleeper = Sleeper(pm=pm, ladder=ladder, buffer=buffer, cfg=cfg, mcfg=mcfg,
                       sched=sched, workdir=workdir, probe=probe,
                       clock=lambda: now[0],
-                      quiet=QuietWindow() if args.quiet == "on" else False)
+                      quiet=QuietWindow() if args.quiet == "on" else False,
+                      blocks=True if args.blocks == "on" else None)
 
     def num(row: dict, key: str, fmt: str, width: int) -> str:
         v = row.get(key)
@@ -180,6 +187,9 @@ def main() -> None:
     print("\nprobe trend (base plasticity):", sleeper.hist.trend("base").text() or "n/a")
     print("probe trend (adapter plasticity):", sleeper.hist.trend("adapter").text() or "n/a")
     print("slot states:", {s.name: s.state.value for s in ladder.slots})
+    if sleeper.hist.block_verdict:
+        print("diffusion blocks:", "adopted" if sleeper.split else "declined",
+              "-", sleeper.hist.block_verdict.get("reason", ""))
     print("core KL baseline:", f"{sleeper.hist.core_baseline:.3f}")
 
 

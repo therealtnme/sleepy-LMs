@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from sleepy.ladder import freeze_slot
+import torch
+from transformers import LlamaConfig, LlamaForCausalLM
+
+from sleepy.blocks import BlockConfig
+from sleepy.ladder import Ladder, attach, freeze_slot, open_slot
 from sleepy.merge import MergeConfig
 from sleepy.orchestrator import History, Schedule, Sleeper, due
 from sleepy.sleep import SleepConfig, run
@@ -105,10 +109,10 @@ def _cfg():
     return SleepConfig(tokenizer=StubTokenizer(), seq_len=16, budget_steps=4, passes=1)
 
 
-def _sleeper(pm, ladder, buffer, workdir, probe=None, **sched):
+def _sleeper(pm, ladder, buffer, workdir, probe=None, blocks=None, **sched):
     return Sleeper(pm, ladder, buffer, _cfg(), MergeConfig(inner_steps=1),
                    Schedule(min_items=1, min_hours=0.0, **sched), workdir,
-                   probe=probe, quiet=False)
+                   probe=probe, quiet=False, blocks=blocks)
 
 
 def _frozen_source(pm, ladder, buffer):
@@ -230,3 +234,99 @@ def test_dormant_units_alarm_the_base(pm, ladder, buffer, workdir):
     alarming, detail = s._base_alarmed()
 
     assert alarming and "dormant units" in detail
+
+
+# -- diffusion-block autodetection -----------------------------------------
+
+def test_blocks_are_off_unless_asked_for(pm, ladder, buffer, workdir):
+    """The A/B is two training runs; the demo should not pay for it by default."""
+    s = _sleeper(pm, ladder, buffer, workdir)
+
+    assert s.blocks is None
+    assert not s.blocks_due()
+    assert s.split is False
+
+
+def test_blocks_due_after_the_interval(pm, ladder, buffer, workdir):
+    s = _sleeper(pm, ladder, buffer, workdir, blocks=True, block_every=2)
+    assert s.blocks.blocks == s.sched.block_blocks  # `True` means the default probe
+
+    assert not s.blocks_due()
+    s.hist.slots_opened = 2
+    assert s.blocks_due()
+
+
+def test_zero_interval_disables_the_probe(pm, ladder, buffer, workdir):
+    s = _sleeper(pm, ladder, buffer, workdir, blocks=True, block_every=0)
+    s.hist.slots_opened = 100
+
+    assert not s.blocks_due()
+
+
+def test_blocks_due_yields_to_backoff(pm, ladder, buffer, workdir):
+    """A model failing its last commit is not worth two throwaway training runs."""
+    s = _sleeper(pm, ladder, buffer, workdir, blocks=True, block_every=1)
+    s.hist.slots_opened = 1
+    assert s.blocks_due()
+
+    s.hist.failures = s.sched.backoff_sleeps
+    assert not s.blocks_due()
+
+
+def test_check_blocks_records_a_refusal_and_learns_the_cadence(pm, ladder, buffer, workdir):
+    """Two layers cannot split under the depth floor: a refusal, still logged."""
+    s = _sleeper(pm, ladder, buffer, workdir, blocks=BlockConfig(blocks=2, steps=2))
+
+    row = s.check_blocks()
+
+    assert row["event"] == "blocks" and row["gate_ok"] is False
+    assert "cannot denoise" in row["reason"]
+    assert s.cfg.block is False and s.split is False
+    assert s.hist.last_block_at == s.hist.slots_opened
+    assert '"event": "blocks"' in (workdir / "sleep.jsonl").read_text(encoding="utf-8")
+
+
+def _deep(workdir):
+    """Four layers: deep enough for a legal 2-block split."""
+    torch.manual_seed(0)
+    cfg = LlamaConfig(vocab_size=256, hidden_size=64, intermediate_size=128,
+                      num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=4)
+    ladder = Ladder.build(["down_proj", "v_proj"], (1, 1, 2))
+    return attach(LlamaForCausalLM(cfg), ladder), ladder
+
+
+def test_check_blocks_switches_training_on_an_accepted_split(workdir, buffer):
+    pm, ladder = _deep(workdir)
+    tile = ladder.slots[0]
+    open_slot(pm, ladder, tile)  # a live slot: `run_both` needs grad-enabled params
+    # Quality is pinned loose so the gate turns on memory alone (a fixed 50% cut);
+    # what is under test is the wiring, not the loss magnitudes of a 2-step run.
+    cfg_b = BlockConfig(blocks=2, steps=2, max_quality_loss=1.0)
+    s = _sleeper(pm, ladder, buffer, workdir, blocks=cfg_b)
+
+    row = s.check_blocks()
+
+    assert row["gate_ok"] is True
+    assert s.cfg.block is True and s.cfg.block_blocks == 2 and s.split is True
+
+
+def test_unsupported_model_disables_the_probe(pm, ladder, buffer, workdir, monkeypatch):
+    from sleepy.blocks import UnsupportedModel
+
+    def boom(*_a, **_k):
+        raise UnsupportedModel("no layers")
+
+    monkeypatch.setattr("sleepy.orchestrator.run_both", boom)
+    s = _sleeper(pm, ladder, buffer, workdir, blocks=True)
+
+    row = s.check_blocks()
+
+    assert row["gate_ok"] is False and "no layers" in row["reason"]
+    assert s.blocks is None and not s.blocks_due()  # not retried every cycle
+
+
+def test_step_runs_the_ab_instead_of_sleeping_when_it_is_due(pm, ladder, buffer, workdir):
+    s = _sleeper(pm, ladder, buffer, workdir, blocks=True, block_every=1)
+    s.hist.slots_opened = 1
+
+    assert s.step()["event"] == "blocks"

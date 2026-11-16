@@ -93,10 +93,31 @@ arrives.
 
 The only clock in the mechanics is the one the window reads.
 
+### Whether to split the depth
+
+Diffusion Blocks trains one contiguous depth block at a time against a corrupted
+boundary state, so peak activation falls by roughly the block count. The saving
+exists only at matched step count, and only while every block keeps enough depth
+to denoise at all, so the split is measured, never assumed:
+
+```python
+from sleepy.blocks import BlockConfig
+sleeper.blocks = BlockConfig(blocks=2)    # opt in; the A/B is off by default
+row = sleeper.check_blocks()              # matched-step A/B; trains only throwaway clones
+print(row["gate_ok"], row["reason"])      # e.g. False, '2 layer/block < 2: ...'
+```
+
+You rarely call it by hand: `step()` does so every `Schedule.block_every` sleeps
+and records the verdict in `sleep.jsonl`. That verdict is sticky but re-askable,
+and it is the switch — an accepted split sets `SleepConfig.block`, turning each
+tier-1 step into one block's denoising step. `savings()` projects the ceiling for
+a split size, so a six-block claim on a twelve-layer model is visible as four.
+
 For an end-to-end run:
 
 ```
 python -m sleepy.demo --model HuggingFaceTB/SmolLM2-135M --sessions 12
+python -m sleepy.demo --model HuggingFaceTB/SmolLM2-135M --blocks on   # measure it
 ```
 
 ## Layout
@@ -107,6 +128,7 @@ python -m sleepy.demo --model HuggingFaceTB/SmolLM2-135M --sessions 12
 | `sleepy/ladder.py` | slot states and the rank ladder; `attach`/`refresh` lifecycle |
 | `sleepy/sleep.py` | tier 1 sleep: importance select → N passes → one step → gate |
 | `sleepy/merge.py` | tier 2 atomic merge with TIES truncation, and the tier-1 handoff |
+| `sleepy/blocks.py` | diffusion-block training and the matched-step A/B that gates it |
 | `sleepy/signals.py` | KL guard, trust region, effective rank, dormant-unit readout |
 | `sleepy/probe.py` | throwaway-copy plasticity exam |
 | `sleepy/quiet.py` | learned low-traffic window, with abstention until calibrated |
@@ -119,7 +141,9 @@ python -m sleepy.demo --model HuggingFaceTB/SmolLM2-135M --sessions 12
 pytest
 ```
 
-The suite is CPU-only, uses a two-layer stub model, and runs in seconds.
+The suite is CPU-only and runs in seconds. Most tests use a two-layer stub model;
+the block tests build a four- or six-layer one, since a two-layer model cannot
+split under the depth floor.
 
 ## License
 
@@ -130,3 +154,4 @@ MIT — see [LICENSE](LICENSE).
 - arXiv:2606.24752 — Can Scale Save Us From Plasticity Loss in LMs?
 - arXiv:2605.26099 — Do Language Models Need Sleep?
 - arXiv:2606.03979 — Language Models Need Sleep: Self-Modify and Consolidate Memories
+- Diffusion Blocks — Sakana AI (block-local denoising as a depth-serial training scheme)

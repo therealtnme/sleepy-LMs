@@ -39,6 +39,12 @@ class SleepConfig:
     gate_core_tol: float = 0.05
     budget_steps: int = 40
     seed: int = 0
+    # Off unless a measurement said it was worth it (`blocks.run_both`). Set, a
+    # step trains one contiguous depth block against noise instead of the whole
+    # model, trading a small quality loss for a peak-activation cut.
+    block: bool = False
+    block_blocks: int = 2            # only honoured when `block` is on
+    block_sigma: tuple[float, float] = (0.05, 0.60)
 
 
 @dataclass
@@ -163,22 +169,42 @@ def run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig) -> Sle
 
     losses: list[float] = []
     step, cursor, truncated = 0, 0, False
+    # A split fixes each step's depth block up front and cycles them, so every
+    # block gets an equal share of the budget instead of the tail getting none.
+    span = None
+    if cfg.block:
+        from . import blocks  # circular import: blocks imports this module
+
+        span = blocks.plan(len(blocks.layers_of(pm)), blocks.BlockConfig(
+            blocks=cfg.block_blocks, sigma_lo=cfg.block_sigma[0],
+            sigma_hi=cfg.block_sigma[1], seed=cfg.seed), cfg.budget_steps)
     pm.train()
     while step < cfg.budget_steps:
         batch = batches[cursor % len(batches)]
         cursor += 1
         batch_loss = 0.0
         for _ in range(cfg.passes):
-            out = pm(**batch)
-            loss = out.loss
+            if span is None:
+                out = pm(**batch)
+                logits, lm_loss = out.logits, out.loss
+            else:
+                lo, hi, sigma = span[step]
+                logits, labels = blocks.block_logits(pm, batch, lo, hi, sigma)
+                lm_loss = torch.nn.functional.cross_entropy(
+                    logits.reshape(-1, logits.shape[-1]), labels.reshape(-1),
+                    ignore_index=-100)
+            loss = lm_loss
             beta = signals.anneal(step, cfg.budget_steps, cfg.kl_beta, 0.0, cfg.kl_hold)
-            if beta > 0:
+            # Off in block mode: the student sees a noised boundary state, so its
+            # KL against the clean teacher is dominated by the noise scale, not
+            # by what the step learned.
+            if beta > 0 and span is None:
                 with torch.no_grad():
                     tlog = teacher(input_ids=batch["input_ids"],
                                    attention_mask=batch["attention_mask"]).logits
-                loss = loss + beta * signals.kl_guard(out.logits, tlog)
+                loss = loss + beta * signals.kl_guard(logits, tlog)
             (loss / cfg.passes).backward()
-            batch_loss += float(out.loss.detach())
+            batch_loss += float(lm_loss.detach())
         torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
         project(pm, slot.name, cfg, occupied)
         opt.step()

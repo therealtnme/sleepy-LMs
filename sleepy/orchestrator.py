@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import signals
+from .blocks import BlockConfig, UnsupportedModel, prepare, run_both
 from .buffer import Buffer
 from .ladder import Ladder, SlotState, masked_slots, refresh, release_slot
 from .merge import MergeConfig, distill, merge_slot
@@ -39,6 +40,8 @@ class Schedule:
     dormant_alarm: float = 0.35
     norm_growth_alarm: float = 0.55    # relative rise vs first recorded norm
     backoff_sleeps: int = 3
+    block_every: int = 10              # sleeps between diffusion-block A/B probes; 0 = off
+    block_blocks: int = 2              # the paper's sweet spot; 3+ usually loses
 
 
 @dataclass
@@ -54,6 +57,8 @@ class History:
     last_sleep_ts: float = 0.0
     merged_since_promote: int = 0
     gate_events: list[str] = field(default_factory=list)
+    block_verdict: dict | None = None   # last A/B report; persists so a split is sticky
+    last_block_at: int = 0              # slots_opened when the last probe ran
 
     def trend(self, tier: str) -> Trend:
         return self.probes.setdefault(tier, Trend())
@@ -104,7 +109,7 @@ class Sleeper:
     def __init__(self, pm, ladder: Ladder, buffer: Buffer, cfg: SleepConfig,
                  mcfg: MergeConfig, sched: Schedule, workdir: Path,
                  probe: Probe | None = None, quiet: QuietWindow | bool | None = None,
-                 clock=time.time):
+                 blocks: BlockConfig | bool | None = None, clock=time.time):
         """`quiet` is on by default, so `step()` learns the window from the
         timestamps instead of waiting out `min_hours`. Pass `quiet=False` for a
         fixed quiet period, or your own `QuietWindow`.
@@ -126,6 +131,15 @@ class Sleeper:
         # a `QuietWindow` is used as given. `True` (the natural guess) means the
         # default window rather than being stored as a bool.
         self.quiet = QuietWindow() if quiet is None or quiet is True else (quiet or None)
+        # `blocks` is off unless asked for: the A/B is two short training runs,
+        # which on a CPU demo costs more than the answer is worth. `True` means
+        # the default `BlockConfig` at `sched.block_blocks`.
+        if blocks is True:
+            self.blocks: BlockConfig | None = BlockConfig(blocks=self.sched.block_blocks)
+        elif blocks:
+            self.blocks = blocks
+        else:
+            self.blocks = None
 
     # -- clock persistence -------------------------------------------------
     @property
@@ -257,6 +271,52 @@ class Sleeper:
                 self.buffer.bank_core([it])
         self._counts = counts
 
+    # -- diffusion-block autodetection -------------------------------------
+    def blocks_due(self) -> bool:
+        """Periodic, and never while backoff is on — same evidence rule as sleep.
+
+        The probe trains two throwaway clones, so re-running it against a model
+        still failing its last commit only spends compute on the same answer.
+        """
+        if self.blocks is None or not self.sched.block_every:
+            return False
+        if self.hist.slots_opened - self.hist.last_block_at < self.sched.block_every:
+            return False
+        return self.hist.failures < self.sched.backoff_sleeps
+
+    def check_blocks(self) -> dict:
+        """Run the A/B on clones and record whether a split is worth adopting.
+
+        Nothing is trained in place, so a verdict can be re-taken later: the
+        split widens the same model, and depth that could not denoise at sleep
+        10 can still not denoise at sleep 100, which is exactly what keeps this
+        cheap to re-ask.
+        """
+        batches = prepare(self.buffer, self.cfg, self.blocks)
+        try:
+            rep = run_both(self.pm, batches, self.blocks)
+        except UnsupportedModel as e:
+            self.blocks = None           # no layer list: do not retry every cycle
+            row = {"event": "blocks", "gate_ok": False, "reason": str(e)}
+            write_report([row], self.workdir / "sleep.jsonl")
+            return row
+        row = rep.row() | {"event": "blocks"}
+        self.hist.last_block_at = self.hist.slots_opened
+        # Sticky-but-retractable: a refusal must decay into a re-ask, not a
+        # permanent latch, or a model that grows in depth never gets re-tested.
+        self.hist.block_verdict = row
+        # The verdict is the switch: everything downstream only reads `cfg.block`.
+        self.cfg.block = bool(rep.gate_ok)
+        if rep.gate_ok:
+            self.cfg.block_blocks = rep.blocks
+        write_report([row], self.workdir / "sleep.jsonl")
+        return row
+
+    @property
+    def split(self) -> bool:
+        """Whether the last measurement said the split beats end-to-end."""
+        return bool(self.hist.block_verdict and self.hist.block_verdict.get("gate_ok"))
+
     # -- handoff / merge ---------------------------------------------------
     def handoff(self) -> dict:
         src = self.ladder.frozen()[-1] if self.ladder.frozen() else None
@@ -306,6 +366,8 @@ class Sleeper:
             row = {"event": "idle", "reason": why}
             write_report([row], self.workdir / "sleep.jsonl")
             return row
+        if self.blocks_due():
+            return self.check_blocks()
         alarming, detail = self._base_alarmed()
         exhausted = self.ladder.exhausted()
         top = self.ladder.frozen()[-1] if self.ladder.frozen() else None

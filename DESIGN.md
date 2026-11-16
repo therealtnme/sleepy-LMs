@@ -168,6 +168,35 @@ lifted directly:
   ordering: the RL/self-generated pass runs on top of a frozen, already-gated
   adapter, never on parameters that are still moving.
 
+### 4.5 `[Δ]` Diffusion blocks, gated by a measurement
+
+A sleep here is a `budget_steps` loop over a batch, each step a full-depth
+forward and backward. Diffusion Blocks (Sakana) slices that depth into contiguous
+blocks, gives each its own noise band, and trains each block against a
+corrupt→clean target at its own boundary. Nothing flows back across a boundary,
+so retained activation and the backward graph shrink by roughly the block count —
+a training-time saving, which is exactly where sleep is expensive.
+
+Three deltas from the paper:
+
+* **Measured, not assumed.** `blocks.run_both` trains two clones at matched step
+  count, one end-to-end and one split, and `decide()` refuses the split unless it
+  saves `min_memory_gain` peak activation for at most `max_quality_loss`
+  end-to-end loss. `check_blocks()` takes that verdict and switches with it;
+  `SleepConfig.block` is the only thing downstream reads.
+* **Depth floor.** Two blocks beat end-to-end in the paper; three or more
+  degrade, and by six it is worse than not splitting. A block needs a couple of
+  layers to denoise, so `min_block_layers` refuses shallower splits and
+  `savings()` reports the real ceiling — `1/blocks` only while every block stays
+  legal, then flat — rather than the headline ratio.
+* **KL off in block mode.** The student sees a noised boundary state, so its KL
+  to the clean teacher measures the noise scale, not what the step learned. The
+  anchor rules of §4.4 that survive are the trust region and the core-set gate,
+  which read the committed delta and so still apply.
+
+The forward pass keeps every frozen slot active, so a split trains the same
+composed model as §4; only the depth of the gradient graph changes.
+
 ## 5. Tier 2 — absorbing the adapter into base weights
 
 ### 5.1 Schedule
@@ -390,6 +419,23 @@ Resolved, with the evidence that closed each one:
   retried, and the retry is offered the same ladder. The counter is in-process and
   only the three commit paths write it, so a restart clears it; a slot or handoff
   that never commits cannot back off.
+* **The block saving is measured on a stub, not at scale.** `peak_activation`
+  counts retained activation bytes and the arithmetic is exact (a 2-block split
+  halves them), but it is blind to allocator padding, optimizer state, and the
+  weight cache, so it is a proxy for the RSS a real split would save — not a
+  measurement of it. `run_both`'s quality arm is also only a 12-step run at
+  `5e-5`; the paper's ordering (2 blocks beat end-to-end, 6 lose to it) is
+  encoded as a default and a depth floor, not reproduced here. No number above
+  the few-hundred-million-parameter SmolLM2 scale is confirmed.
+* **A split's verdict is in-process only.** `History.block_verdict` is not
+  persisted, so a restart forgets an accepted split and re-asks after
+  `block_every` sleeps rather than resuming it. That is the safe direction —
+  a stale acceptance never outlives the model it was measured on — but it also
+  means the cost is paid again after every restart.
+* **`distill_inner` has no caller.** It trains a slot block-by-block against a
+  teacher base for the merge-residual case, where a whole-model forward no longer
+  fits, but `merge.distill` still trains whole-model. Wiring it in needs the
+  fit-failure trigger that would choose it.
 * **Concurrent appends are serialised; the reservoir is not.** The log takes a
   sidecar advisory lock (`msvcrt` locking on Windows), so records no longer
   interleave or vanish and a torn tail line is skipped on load. Two `Buffer`
@@ -431,8 +477,9 @@ Resolved, with the evidence that closed each one:
 
 `sleepy/` implements the machinery against SmolLM2-135M on CPU: buffer,
 one-probe importance sampling, N-pass loop with gradient accumulation, rank
-ladder + handoff, KL/trust-region anchor, merge protocol, and the full
-instrumentation table. `python -m sleepy.demo` runs a multi-session scenario with
+ladder + handoff, KL/trust-region anchor, merge protocol, diffusion-block
+training with its matched-step A/B, and the full instrumentation table.
+`python -m sleepy.demo` runs a multi-session scenario with
 a synthetic knowledge stream and prints the signals above so the schedule can be
 watched end to end. Numbers from a 135M CPU run are for *shape* only.
 
@@ -441,3 +488,4 @@ watched end to end. Numbers from a 135M CPU run are for *shape* only.
 * arXiv:2606.24752 — Can Scale Save Us From Plasticity Loss in LMs? (Zyphra)
 * arXiv:2605.26099 — Do Language Models Need Sleep? (Lee, McLeish, Goldstein, Fanti)
 * arXiv:2606.03979 — Language Models Need Sleep: Self-Modify and Consolidate Memories (Behrouz, Hashemi, Mirrokni)
+* Diffusion Blocks — Sakana AI (block-local denoising as a depth-serial training scheme)

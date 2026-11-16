@@ -50,6 +50,10 @@ class Ladder:
     # is switched on, and kept when it is switched off again so turning it back
     # on resumes from the learned state rather than from neutral.
     controller: object | None = None
+    # Pass count the next sleep starts from when adaptive depth is on; None
+    # until a sleep has measured one. Rate memory, not model memory: it describes
+    # how converged this model is on this experience, so it belongs with the ladder.
+    sleep_depth: int | None = None
 
     @classmethod
     def build(cls, modules: list[str], ranks: tuple[int, ...] = RANKS,

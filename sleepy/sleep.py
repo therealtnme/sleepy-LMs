@@ -14,7 +14,7 @@ from pathlib import Path
 
 import torch
 
-from . import components, controller, optimizer, signals
+from . import assoc, components, controller, optimizer, signals
 from .buffer import Buffer, Item, render
 from .ladder import Ladder, Slot, freeze_slot, open_slot, quarantine_slot
 
@@ -71,6 +71,22 @@ class SleepConfig:
     adapt: bool = False
     adapt_lr: float = 0.02           # learning rate for the coefficients
     adapt_decay: float = 0.02        # pull back to neutral (mult 1, gate 1)
+    # Adaptive sleep depth. Off by default: it can stop a pass early on a noisy
+    # reading and the trigger is a loss that is already down to float noise on a
+    # 135M CPU run. On, the pass loop stops once an extra pass stops improving
+    # the batch loss by `depth_tol` relative, between `depth_min` and `passes`
+    # passes, and the next sleep starts from where this one ended.
+    depth_adapt: bool = False
+    depth_tol: float = 0.02          # relative loss improvement a pass must buy
+    depth_min: int = 1
+    # Associative replay: pull the nearest lexical neighbours of the picked
+    # items into the same batch. Off by default — it trades batch diversity for
+    # topic coherence, and the neighbours are chosen by a lexical proxy that can
+    # group on a shared stopword rather than a shared subject.
+    assoc: bool = False
+    assoc_k: int = 2                 # neighbours looked up per selected item
+    assoc_min: float = 0.30          # cosine floor a neighbour must clear
+    assoc_share: float = 0.5         # added items as a share of the batch
 
 
 @dataclass
@@ -97,13 +113,18 @@ class SleepReport:
     adapt_mult: float = float("nan")
     adapt_gate: float = float("nan")
     adapt_steps: int = 0
+    # Mean pass count over the window. 1 means the depth collapsed to plain
+    # fine-tuning, `passes` means every step took the full loop.
+    depth: float = float("nan")
+    # Items added to the batch by associative expansion (0 when off).
+    assoc: int = 0
     gate_ok: bool = False
     reason: str = ""
 
     KEYS = ("slot", "rank", "steps", "truncated", "loss_first", "loss_last",
             "kl_commit", "core_loss", "delta_ratio", "eff_rank", "comp_live",
             "comp_moving", "rejuvenated", "adapt_mult", "adapt_gate",
-            "adapt_steps", "gate_ok", "reason")
+            "adapt_steps", "depth", "assoc", "gate_ok", "reason")
 
     def row(self) -> dict:
         return {k: getattr(self, k) for k in self.KEYS}
@@ -168,6 +189,30 @@ def select(buffer: Buffer, cfg: SleepConfig, rng: random.Random,
     return keep
 
 
+def _next_depth(n: int, prev: float, now: float, cfg: SleepConfig) -> int:
+    """Shrink or widen the pass count by one from the loss movement on a batch.
+
+    The reading is `now` against the *same batch's* loss at an earlier step, not
+    the pass before it inside the same step: no optimizer step happens between
+    passes and dropout is zero, so every pass in a step sees identical weights
+    and returns an identical loss — a pass-to-pass gain is always exactly zero
+    and would collapse the depth on the first step.
+
+    Until the budget has cycled the batch list once there is no same-batch
+    reading; the previous step's loss stands in, which is noisier on a mixed
+    batch list but is the only movement available on a short budget.
+
+    Once the model stops improving a batch by `depth_tol` relative, the extra
+    passes are buying nothing and the depth drops; while it is still improving,
+    it climbs back. Both ends are clamped (`depth_min`, `passes`) so one noisy
+    pair can move it only a single pass.
+    """
+    gain = (prev - now) / max(abs(prev), 1e-9)
+    if gain < cfg.depth_tol:
+        return max(cfg.depth_min, n - 1)
+    return min(cfg.passes, n + 1)
+
+
 @torch.no_grad()
 def core_loss(pm, adapter: str, core: list[Item], cfg: SleepConfig) -> float:
     """Anchor readout: conversational loss on the fixed core set."""
@@ -219,6 +264,17 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
     candidates = [p for p in buffer.all() if p.key() not in {c.key() for c in buffer.core}]
     importance(pm, slot.name, candidates, cfg)
     items = select(buffer, cfg, rng, candidates)
+    assoc_added = 0
+    if cfg.assoc:
+        # Index the whole pool, not `items`: a neighbour is worth pulling in
+        # precisely when the sampler did not pick it, and scoring only the
+        # chosen few would re-add what is already there.
+        pool = [p for p in candidates if p.key() not in {i.key() for i in items}]
+        index = assoc.Index().build(items + pool)
+        items, assoc_added = assoc.expand(index, items, pool, cfg.assoc_k,
+                                          cfg.assoc_min, cfg.assoc_share)
+    # Every selected item lands exactly once: `expand` is additive and draws
+    # from `pool`, which is disjoint from `items`.
 
     energy = {"grad": torch.zeros(slot.rank)}
 
@@ -242,6 +298,7 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
     imp = torch.zeros(slot.rank)
     pending = None
     adapt_steps, mult_sum, gate_sum = 0, 0.0, 0.0
+    depth_sum = 0
     # A split fixes each step's depth block up front and cycles them, so every
     # block gets an equal share of the budget instead of the tail getting none.
     span = None
@@ -251,12 +308,27 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
         span = blocks.plan(len(blocks.layers_of(pm)), blocks.BlockConfig(
             blocks=cfg.block_blocks, sigma_lo=cfg.block_sigma[0],
             sigma_hi=cfg.block_sigma[1], seed=cfg.seed), cfg.budget_steps)
+    # Adaptive depth. `n_passes` is this step's count, fixed before any pass so
+    # the 1/N gradient scale is exact; it is re-chosen after the step from how
+    # much this batch has moved since it was last seen. A fresh ladder and a
+    # disabled feature both start at the configured maximum, so off is
+    # bit-identical to the fixed loop.
+    n_passes = cfg.passes
+    if cfg.depth_adapt and ladder.sleep_depth is not None:
+        n_passes = max(cfg.depth_min, min(cfg.passes, ladder.sleep_depth))
+    # cursor -> that step's loss, so a batch's next visit can be compared to its
+    # last one. Bounded by the budget, which bounds the number of keys. Until the
+    # budget is long enough to cycle the batch list, the previous step's loss is
+    # the only reading there is; it is a weaker one (different batch) and is
+    # used only as the fallback.
+    seen: dict[int, float] = {}
+    prev_loss = None
     pm.train()
     while step < cfg.budget_steps:
         batch = batches[cursor % len(batches)]
         cursor += 1
         batch_loss = 0.0
-        for _ in range(cfg.passes):
+        for _ in range(n_passes):
             if span is None:
                 out = pm(**batch)
                 logits, lm_loss = out.logits, out.loss
@@ -276,8 +348,23 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
                     tlog = teacher(input_ids=batch["input_ids"],
                                    attention_mask=batch["attention_mask"]).logits
                 loss = loss + beta * signals.kl_guard(logits, tlog)
-            (loss / cfg.passes).backward()
+            (loss / n_passes).backward()
             batch_loss += float(lm_loss.detach())
+        # Converged yet? Judge this step's loss against the same batch's loss at
+        # the previous step that saw it (one full cycle of `batches` back).
+        # There is a step of lag and no extra forward; the first cycle has no
+        # same-batch "before", so the previous step stands in. See `_next_depth`
+        # for why cross-step rather than pass-to-pass.
+        depth_sum += n_passes
+        if cfg.depth_adapt:
+            here = cursor - 1                 # `cursor` already advanced past this batch
+            mean = batch_loss / n_passes
+            prior = seen.get(here - len(batches))
+            if prior is not None:
+                n_passes = _next_depth(n_passes, prior, mean, cfg)
+            elif prev_loss is not None:
+                n_passes = _next_depth(n_passes, prev_loss, mean, cfg)
+            seen[here] = prev_loss = mean
         torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
         project(pm, slot.name, cfg, occupied)
         if cfg.components or cfg.rejuvenate or ctrl is not None:
@@ -298,9 +385,9 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
             # Judge the previous step by how this one's loss moved, then queue
             # this step's shape to be judged in turn.
             if pending is not None:
-                ctrl.learn(ctrl.reward(pending[0], batch_loss / cfg.passes),
+                ctrl.learn(ctrl.reward(pending[0], batch_loss / n_passes),
                            *pending[1:])
-            pending = (batch_loss / cfg.passes, weight, share, imp, burst, mult, gate)
+            pending = (batch_loss / n_passes, weight, share, imp, burst, mult, gate)
         if (cfg.rejuvenate and not rejuvenated
                 and step + 1 >= int(cfg.budget_steps * cfg.rejuvenate_at)):
             # Halfway through the window: zero the moments of components whose
@@ -320,12 +407,14 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
                                        cfg.component_probes, cfg.component_pairs)
             if fresh is not None and fresh.numel() == slot.rank:
                 imp = fresh.float() / components.MAX
-        losses.append(batch_loss / cfg.passes)
+        losses.append(batch_loss / n_passes)
         step += 1
         if not all(torch.isfinite(torch.tensor(x)) for x in losses[-1:]):
             truncated = True
             break
 
+    if cfg.depth_adapt:
+        ladder.sleep_depth = n_passes
     worst = signals.delta_ratio(pm, slot.name)
     if worst > cfg.delta_cap:
         signals.scale_slot(pm, slot.name, cfg.delta_cap / worst)
@@ -357,7 +446,8 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
                      if slot.plasticity is not None else float("nan")),
         rejuvenated=touched, adapt_mult=mult_sum / adapt_steps if adapt_steps else float("nan"),
         adapt_gate=gate_sum / adapt_steps if adapt_steps else float("nan"),
-        adapt_steps=adapt_steps)
+        adapt_steps=adapt_steps,
+        depth=depth_sum / step if step else float("nan"), assoc=assoc_added)
 
 
 def commit(pm, ladder: Ladder, slot: Slot, rep: SleepReport, cfg: SleepConfig,

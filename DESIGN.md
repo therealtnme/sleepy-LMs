@@ -375,6 +375,60 @@ learning, so it earns its place by measurement first. `adapt_mult`,
 `adapt_gate` and `adapt_steps` are reported per sleep; the first two near 1.0
 mean the controller ran and declined to do anything.
 
+### 6.4 Adaptive sleep depth
+
+§4.2 fixes N as a constant, but N=3 is right only for a batch the model has not
+converged on. On a batch it already fits, the extra passes move the loss by float
+noise and are paid for nothing — and every pass is a forward and a backward.
+
+The reading is deliberately not the pass-to-pass loss: no optimizer step happens
+between passes and the default dropout is zero, so every pass in a step sees
+identical weights, returns an identical loss, and a within-step "gain" is always
+exactly zero. Instead each step's batch loss is compared with the same batch's
+loss one full cycle of the batch list earlier — one step of lag, no extra
+forward, no probe. Until the budget has cycled the list once there is no
+same-batch reading and the previous step stands in; that pair mixes batches and
+is a weaker signal, but on a short budget it is the only movement on offer.
+
+* gain below `depth_tol` relative → the depth drops one pass (`depth_min` floor)
+* gain at or above it → the depth climbs one pass (`passes` ceiling)
+
+The chosen count is fixed before a step's first pass so the `1/N` gradient
+scale is exact, carried to the next sleep on `Ladder.sleep_depth`, and reported
+per sleep as a mean `depth`. A fresh ladder and the feature switched off both
+start at `passes`, so off is bit-identical to the fixed loop.
+
+**Off by default.** It costs nothing but it can misfire: `depth_tol` is a
+relative threshold on a loss that, on a 135M CPU run, is already close to noise
+between cycles, and a depth that has collapsed re-widens slowly (one pass per
+step). When it works it is a straight throughput win; when it misfires it quietly
+turns a three-pass sleep into a plain fine-tune.
+
+### 6.5 Associative replay
+
+The reservoir keeps the long tail but scatters it (§7): two facts about the same
+town are as likely to be replayed in different sleeps as together, so each is
+trained in a batch with nothing else about the town and the slot fits two
+singletons instead of the relation between them.
+
+Association is a lexical proxy for that relation. The pool — the items the
+sampler already passed over — is indexed by hashed word unigrams and bigrams,
+L2-normalised, compared by cosine. Each chosen item's `assoc_k` nearest
+neighbours above `assoc_min` cosine are appended, capped in total at
+`assoc_share` × the batch. The index is rebuilt from the live pool every sleep,
+so it costs one linear pass and cannot go stale.
+
+The expansion is **additive** and draws only from the rejected pool, so no
+selected item is displaced and none is added twice. The cost is length: every
+extra item is another forward and backward on every pass, which is why the share
+caps it.
+
+**Off by default.** It trades diversity for coherence — the random survivors
+(§4.1) exist precisely to keep topics apart, and association pulls them back
+together. It is also a *lexical* proxy: two passages on unrelated topics that
+share a stopword score above the floor, and a genuine paraphrase that shares no
+word scores below it.
+
 ## 7. Replay mix
 
 Order of protection, strongest first:
@@ -527,6 +581,18 @@ Resolved, with the evidence that closed each one:
   `block_every` sleeps rather than resuming it. That is the safe direction —
   a stale acceptance never outlives the model it was measured on — but it also
   means the cost is paid again after every restart.
+* **Adaptive depth's "converged" is a proxy.** §6.4 compares a batch's loss
+  across steps, which is a loss movement, not a measurement that the batch *is*
+  converged; a batch whose loss oscillates reads as converged and loses a pass it
+  needed. Against an evicted-then-reloaded batch the comparison is also across
+  different items, since `batches_of` is rebuilt per sleep. The whole rule moves
+  at one pass per step, so a bad first guess re-widens slowly.
+* **Association is lexical and hashed.** §6.5 scores shared words, so a
+  paraphrase sharing no word scores below the floor and two unrelated passages
+  sharing a stopword score above it. 4096 buckets also collide: two distinct
+  bigrams can land on one and inflate a similarity. The neighbours are appended
+  without a quality check — nothing measures whether the expanded batch trained
+  better than the unexpanded one would have.
 * **`distill_inner` has no caller.** It trains a slot block-by-block against a
   teacher base for the merge-residual case, where a whole-model forward no longer
   fits, but `merge.distill` still trains whole-model. Wiring it in needs the
@@ -588,7 +654,7 @@ one-probe importance sampling, N-pass loop with gradient accumulation, rank
 ladder + handoff, KL/trust-region anchor, merge protocol, per-rank-component
 importance/plasticity readouts feeding the merge, diffusion-block
 training with its matched-step A/B, selective optimizer rejuvenation, adaptive
-plasticity control, and the full instrumentation table.
+plasticity control, adaptive sleep depth, and the full instrumentation table.
 `python -m sleepy.demo` runs a multi-session scenario with
 a synthetic knowledge stream and prints the signals above so the schedule can be
 watched end to end. Numbers from a 135M CPU run are for *shape* only.

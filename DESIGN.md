@@ -330,8 +330,29 @@ what survives the prune — a kept component still has a small tail.
 Adam's second moment decays with a half-life of ~`1/(1 − β₂)` steps, which
 outlives a whole sleep window. A component that spiked at step 2 therefore keeps
 a large `exp_avg_sq` for the rest of the run and every later gradient on it is
-normalized down — including fresh signal. Zeroing the moments of exactly the
-components that went quiet re-arms them; every other component keeps its history.
+normalized down — including fresh signal. Re-arming exactly the components that
+went quiet restores them; every other component keeps its history.
+
+**Re-arm, not wipe.** Zeroing both moments hands the component the shape of a
+*first* step, `m = 0.1g` against `v = 0.001g²` — but the step counter is per
+parameter and is not reset, so Adam still applies the current step's correction.
+Those two disagree, and the size lands wherever the mismatch happens to be: a wipe
+is ~0.64× `lr` at step 40, rising toward ~3.2× as the `β₂` correction saturates
+(2.5× at step 1000). It also throws away the lean. Instead `exp_avg` is divided by a
+factor `c` and `exp_avg_sq` multiplied by the same `c`: the corrected ratio
+`m̂/√v̂` scales by `c^-1.5`, so `c = ratio^2/3` lands the next update on `1` while
+the lean the component already had survives.
+
+The target is the *corrected* ratio, not the raw one, and that distinction is
+the whole of the numerics. `1 − β₂ᵗ` needs ~1000 steps to saturate, so at a
+window's length the two differ by ~5×; normalising the raw ratio is what made a
+first version land the re-armed step several times *light*, not heavy. Measured
+on a spike-then-quiet schedule at step 40: without the reset the next step is
+0.06× `lr`, with it 1.02× (the excess is `ε`). A mean that has decayed to
+rounding has no direction left to keep, so it is seeded to the corrected `rms`
+rather than divided by near-zeros. The step counter is not reset: it is per
+parameter, so restarting it would re-correct the components that were *not*
+masked, and the masked ones are corrected arithmetically instead.
 
 `sleepy/optimizer.py:rejuvenate` masks `exp_avg`/`exp_avg_sq` along the rank axis
 (axis 0 of `A` `(rank, d_in)`, axis 1 of `B` `(d_out, rank)` — names disambiguate,

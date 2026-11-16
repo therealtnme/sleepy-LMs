@@ -59,8 +59,8 @@ class SleepConfig:
     # Selective optimizer rejuvenation. Off by default: Paper 1 measured stale
     # Adam moments are not the cause of plasticity loss, so a reset has no
     # demonstrated default benefit. On, the components whose share of the window's
-    # gradient fell below `rejuvenate_share` have their moments zeroed halfway
-    # through the budget, re-arming them for the second half.
+    # gradient fell below `rejuvenate_share` have their moments rescaled halfway
+    # through the budget, re-arming them to a normal step for the second half.
     rejuvenate: bool = False
     rejuvenate_share: float = 0.01
     rejuvenate_at: float = 0.5

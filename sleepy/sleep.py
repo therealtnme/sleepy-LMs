@@ -55,7 +55,14 @@ class SleepConfig:
     # scale are dropped at merge, so a magnitude threshold does not keep what
     # nothing needs. Separate from TIES: this is an absolute rank prune, the
     # `MergeConfig.component_drop_fraction` a rank-relative one. 0 disables it.
-    component_floor: float = 0.5
+    #
+    # 0 by default because the score is peak-normalised: a slot whose components
+    # differ little scores them all near the top, and any floor above 0 would
+    # then prune the weakest for no reason other than relative ordering. Only
+    # *measured* components are eligible, so the unprobed median fill — 56 of 64
+    # components at the default probe cap — cannot prune a component on a
+    # placeholder score.
+    component_floor: float = 0.0
     # Selective optimizer rejuvenation. Off by default: Paper 1 measured stale
     # Adam moments are not the cause of plasticity loss, so a reset has no
     # demonstrated default benefit. On, the components whose share of the window's
@@ -64,6 +71,22 @@ class SleepConfig:
     rejuvenate: bool = False
     rejuvenate_share: float = 0.01
     rejuvenate_at: float = 0.5
+    # Selective reinitialization of rank components, at the end of a sleep: a
+    # component that is neither measured as needed nor still moving is blanked
+    # (fresh `a` row, zeroed `b` column) so the next sleep can find something to
+    # put there. Off by default — like a reset of anything, it can drop knowledge
+    # the readout failed to see, so it is only kept when the reinit batch does
+    # not get worse. Does not need `components`: with it off the importance half
+    # is measured for the reinit alone, unsmoothed.
+    reinit: bool = False
+    # A component qualifies below *both* floors: `reinit_importance` of the byte
+    # scale by smoothed importance (absolute — loss movement is unnormalised)
+    # and `reinit_movement` of it by displacement (relative — that readout is
+    # peak-normalised per window). Raising either alone reinits more.
+    reinit_importance: float = 0.5
+    reinit_movement: float = 0.25
+    # Relative loss the reinit batch may rise by and still be accepted.
+    reinit_loss_tol: float = 0.01
     # Adaptive Plasticity Control: six learned coefficients set a per-component
     # LR multiplier and a trust gate on the optimizer's proposed update. Off by
     # default — it is the one knob here that can make a step *worse* while it
@@ -102,13 +125,21 @@ class SleepReport:
     core_loss: float = float("nan")
     delta_ratio: float = float("nan")
     eff_rank: float = float("nan")
-    # Share of the slot's rank that is measurably needed / still taking gradient.
-    # At or near zero the slot is full of components nothing reads and nothing
-    # moves, which is the plasticity loss the ladder exists to avoid.
+    # Share of the slot's rank that is measurably needed / still changing
+    # position. At or near zero the slot is full of components nothing reads and
+    # nothing moves, which is the plasticity loss the ladder exists to avoid.
     comp_live: float = float("nan")
     comp_moving: float = float("nan")
     # Moment tensors zeroed by a selective rejuvenation (0 when off or skipped).
     rejuvenated: int = 0
+    # Components blanked by a selective reinitialization, and how many of those
+    # the before/after loss check rolled back (0 when off, or when nothing
+    # qualified).
+    reinitialized: int = 0
+    reinit_reverted: int = 0
+    # Mean relative displacement of the rank per step; the plasticity readout
+    # before it is normalised for storage.
+    comp_disp: float = float("nan")
     # Mean multiplier and gate the adaptive controller applied over the window,
     # and the steps it touched. 1.0/1.0 means it ran and did nothing.
     adapt_mult: float = float("nan")
@@ -128,7 +159,8 @@ class SleepReport:
 
     KEYS = ("slot", "rank", "steps", "truncated", "loss_first", "loss_last",
             "kl_commit", "core_loss", "delta_ratio", "eff_rank", "comp_live",
-            "comp_moving", "rejuvenated", "adapt_mult", "adapt_gate",
+            "comp_moving", "comp_disp", "rejuvenated", "reinitialized",
+            "reinit_reverted", "adapt_mult", "adapt_gate",
             "adapt_steps", "depth", "assoc", "gate_ok", "reason")
 
     def row(self) -> dict:
@@ -218,6 +250,18 @@ def _next_depth(n: int, prev: float, now: float, cfg: SleepConfig) -> int:
     return min(cfg.passes, n + 1)
 
 
+def _worse(after: float, start: float, tol: float) -> bool:
+    """Did the check loss rise enough to roll the change back?
+
+    A NaN `after` counts as worse. The spec restores on a *rise*, and NaN is not
+    one — but a non-finite loss coming out of a reinit is a broken slot, and the
+    restore is the part that can put back the factors the readouts measured.
+    """
+    if after != after:                     # NaN
+        return True
+    return after > start + abs(start) * tol
+
+
 @torch.no_grad()
 def core_loss(pm, adapter: str, core: list[Item], cfg: SleepConfig) -> float:
     """Anchor readout: conversational loss on the fixed core set."""
@@ -288,7 +332,25 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
     # Every selected item lands exactly once: `expand` is additive and draws
     # from `pool`, which is disjoint from `items`.
 
-    energy = {"grad": torch.zeros(slot.rank)}
+    # Readout accumulators, keyed by module: a component is (module, rank index),
+    # and a fresh slot's factors only exist per module.
+    energy: dict[str, components.Readout] = {"grad": {}, "disp": {}}
+    # The displacement readout is the plasticity one, so it is paid whenever the
+    # readouts are on at all — not only when a reinit will consume it.
+    # `slot.importance` holds a per-module readout now, so a reinit-only run
+    # clears the whole dict, not one flat vector.
+    reading = cfg.components or cfg.reinit
+    if cfg.reinit:
+        # A reinit pairs the two readouts, so both halves have to describe the
+        # *same* window. A leftover plasticity from the previous sleep would be
+        # paired with this window's importance and would say "frozen" about a
+        # component this window may have moved. Cleared rather than dated: an
+        # unmeasured half then fails `stale_mask` and reinits nothing, which is
+        # the safe side. A reinit-only run also carries a leftover importance
+        # from an earlier window, so that half is cleared too.
+        slot.plasticity = None
+        if not cfg.components:
+            slot.importance = slot.measured = None
 
     batches = batches_of(cfg, items) or [encode(cfg, "")]
     params = [p for p in pm.parameters() if p.requires_grad]
@@ -298,9 +360,7 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
     step, cursor, truncated = 0, 0, False
     rejuvenated, touched = False, 0
     # Adaptive control. `imp` stays zero until the halfway probe supplies a
-    # measurement; `pending` is the previous step's batch and its pre-step loss,
-    # kept so the step can be judged on its own batch once it has landed — a
-    # neighbouring batch differs by more than any coefficient does.
+    # measurement.
     ctrl = None
     if cfg.adapt:
         if ladder.controller is None:
@@ -308,8 +368,7 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
                                                       decay=cfg.adapt_decay)
         ctrl = ladder.controller
         ctrl.eta, ctrl.decay = cfg.adapt_lr, cfg.adapt_decay
-    imp = torch.zeros(slot.rank)
-    pending = None
+    imp: components.Readout = {}
     adapt_steps, mult_sum, gate_sum = 0, 0.0, 0.0
     depth_sum = 0
     # A split fixes each step's depth block up front and cycles them, so every
@@ -381,50 +440,61 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
         torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
         project(pm, slot.name, cfg, occupied)
         if cfg.components or cfg.rejuvenate or ctrl is not None:
-            components.accumulate(energy, components.gradient_energy(pm, slot.name))
+            components.accumulate(energy, components.gradient_contribution(pm, slot.name))
         before = None
         if ctrl is not None:
             weight, share, burst = controller.features(
-                pm, slot.name, slot.rank, energy.get("grad"))
+                pm, slot.name, energy.get("grad"))
             mult, gate = ctrl.weights(weight, share, imp, burst)
             before = controller.snapshot(pm, slot.name)
+        held = components.snapshot(pm, slot.name) if reading else None
         opt.step()
         opt.zero_grad(set_to_none=True)
+        if held is not None:
+            # Relative and per-component, so a large component is not "moving"
+            # for the same absolute step a small one took a quarter of its size
+            # on. Accumulated before the controller rescales, so this reads what
+            # the optimizer wrote and not a coefficient's opinion of it.
+            components.accumulate(energy, components.displacement(pm, slot.name, held),
+                                  "disp")
         if ctrl is not None:
             controller.apply(pm, slot.name, before, mult, gate)
             adapt_steps += 1
-            mult_sum += float(mult.mean())
-            gate_sum += float(gate.mean())
-            # Judge the previous step now that it has landed, on that step's own
-            # batch: the loss it started from (its own `batch_loss`) against the
-            # loss now. A batch is only comparable to itself — neighbouring
-            # batches differ by a sample change far larger than anything a
-            # coefficient does, which is what the old lag compared.
-            if pending is not None:
-                with torch.no_grad():
-                    now = float(pm(**pending["batch"]).loss)
-                ctrl.learn(ctrl.reward(pending["loss"], now), *pending["shape"])
-            pending = {"batch": batch, "loss": batch_loss / n_passes,
-                       "shape": (weight, share, imp, burst, mult, gate)}
+            mult_sum += components.mean(mult)
+            gate_sum += components.mean(gate)
+            # Judge this step immediately, on its own batch: the loss it started
+            # from (`batch_loss`, taken before the step) against the loss now
+            # that the delta has landed and been rescaled. A batch is only
+            # comparable to itself — a neighbouring one differs by a whole sample
+            # change, larger than anything a coefficient does. Judging a step
+            # later instead would fold the following step's update into the
+            # measurement, and the coefficients would be blamed for a delta they
+            # did not cause.
+            with torch.no_grad():
+                now = float(pm(**batch).loss)
+            ctrl.learn(ctrl.reward(batch_loss / n_passes, now),
+                       weight, share, imp, burst, mult, gate)
         if (cfg.rejuvenate and not rejuvenated
                 and step + 1 >= int(cfg.budget_steps * cfg.rejuvenate_at)):
             # Halfway through the window: zero the moments of components whose
             # share of the gradient so far is negligible, so an early spike
             # cannot suppress them for the rest of the run.
-            mask = components.shares(energy, slot.rank) < cfg.rejuvenate_share
+            mask = {n: s < cfg.rejuvenate_share
+                    for n, s in components.shares(energy.get("grad")).items()}
             touched += optimizer.rejuvenate(opt, pm, slot.name, mask)
             rejuvenated = True
-        if (ctrl is not None and items and float(imp.max()) == 0
+        if (ctrl is not None and items and not imp
                 and step + 1 >= int(cfg.budget_steps * cfg.rejuvenate_at)):
             # One probe for the whole run, at the halfway point alongside the
             # rejuvenation: the gate needs a measurement of what the model
             # actually needs, and one forward per component per step is too
             # expensive for every step.
-            fresh = components.measure(pm, slot.name,
-                                       encode(cfg, render(items[: cfg.batch_items])),
-                                       cfg.component_probes, cfg.component_pairs)
-            if fresh is not None and fresh.numel() == slot.rank:
-                imp = fresh.float() / components.MAX
+            got = components.measure(pm, slot.name,
+                                     encode(cfg, render(items[: cfg.batch_items])),
+                                     cfg.component_probes, cfg.component_pairs)
+            if got is not None:
+                scores, _ = got
+                imp = {n: t.float() / components.MAX for n, t in scores.items()}
         losses.append(batch_loss / n_passes)
         step += 1
         if not all(torch.isfinite(torch.tensor(x)) for x in losses[-1:]):
@@ -437,19 +507,77 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
     if worst > cfg.delta_cap:
         signals.scale_slot(pm, slot.name, cfg.delta_cap / worst)
         worst = cfg.delta_cap
-    slot.effective_rank = signals.effective_rank(pm, slot.name)
     # Measured after the step, on the delta as it actually landed: a component
     # that carries nothing reads zero however much of it was trained. Smoothed
     # against the previous readout where there is one, since one forward per
     # component is noisy enough for a single unlucky probe to condemn a needed one.
-    if cfg.components and items:
-        fresh = components.measure(pm, slot.name, encode(cfg, render(items[: cfg.batch_items])),
-                                   cfg.component_probes, cfg.component_pairs)
-        prev = slot.importance
-        slot.importance = (components.smooth(prev, fresh, cfg.component_alpha)
-                           if prev is not None and fresh is not None
-                           and prev.numel() == fresh.numel() else fresh)
-        slot.plasticity = components.quantize(components.shares(energy, slot.rank))
+    probed = encode(cfg, render(items[: cfg.batch_items])) if items else None
+    # One probe serves both readers: `components` wants the scores, a reinit
+    # wants the measured mask beside them. Taken once — a forward per component
+    # is the expensive readout, and two probes of the same batch would differ
+    # only by each other's noise.
+    scores = measured = None
+    if probed is not None and (cfg.components or cfg.reinit):
+        got = components.measure(pm, slot.name, probed,
+                                 cfg.component_probes, cfg.component_pairs)
+        if got is not None:
+            scores, measured = got
+    if cfg.components and scores is not None:
+        slot.importance = components.blend(slot.importance, scores,
+                                           cfg.component_alpha)
+        # Kept beside the smoothed scores so a later prune knows which entries
+        # are measurements. A module absent this window keeps its old mask: its
+        # blended entry is still the old one.
+        slot.measured = measured
+    if energy.get("disp"):
+        # Peak-normalised per window, not an absolute threshold: displacement has
+        # no unit that would make a byte value comparable across sleeps, so only
+        # the ordering between this window's components is preserved. Stored even
+        # when nothing moved at all (lr 0, a frozen window): an all-zero readout is
+        # then a measurement, and the most stale one there is — leaving it `None`
+        # would make the readout indistinguishable from "not taken" and the
+        # reinit could never fire on the case it exists for.
+        slot.plasticity = components.quantize_readout(energy["disp"])
+    reinit, reverted = 0, 0
+    if cfg.reinit and scores is not None:
+        if slot.importance is None:
+            # `components` off says why *report* the readout, not what a reinit
+            # may decide on. Unsmoothable: a reinit-only run has no history to
+            # smooth against, and this window's own score is what the check
+            # judges anyway.
+            slot.importance, slot.measured = scores, measured
+        mask = components.stale_mask(slot.importance, slot.plasticity, measured,
+                                     cfg.reinit_importance, cfg.reinit_movement)
+        if mask is not None:
+            # Blanking the components can only cost what they carried, and the
+            # readout is what decided they carried nothing — so the check is a
+            # second opinion on that, on the sleep's own batch, not a training
+            # signal. Same batch both sides: neighbouring batches differ by far
+            # more than a reinit does.
+            was_training = pm.training
+            try:
+                with torch.no_grad():
+                    pm.eval()
+                    start = float(pm(**probed).loss)
+                saved = components.reinitialize(pm, slot.name, mask)
+                after = start
+                if saved:
+                    with torch.no_grad():
+                        after = float(pm(**probed).loss)
+            finally:
+                # A raise here leaves a blanked slot behind and the caller
+                # quarantines it, so the mode still has to come back.
+                pm.train(was_training)
+            if saved and _worse(after, start, cfg.reinit_loss_tol):
+                components.restore(saved)
+                reverted = components.count(mask)
+            elif saved:
+                reinit = components.count(mask)
+    # After the reinit, not before: a blanked component no longer spans the
+    # directions it did, and the entropy rank would otherwise report the slot as
+    # using more dimensions than it now does — which is exactly the number
+    # `_rank_bound` reads to decide whether a handoff could buy anything.
+    slot.effective_rank = signals.effective_rank(pm, slot.name)
 
     gate_batch = encode(cfg, render(buffer.core[: cfg.batch_items])) if buffer.core else None
     return SleepReport(
@@ -460,9 +588,11 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
         core_loss=core_loss(pm, slot.name, buffer.core, cfg),
         delta_ratio=worst, eff_rank=slot.effective_rank,
         comp_live=components.live_fraction(slot.importance),
-        comp_moving=(float((slot.plasticity > 0).float().mean())
-                     if slot.plasticity is not None else float("nan")),
-        rejuvenated=touched, adapt_mult=mult_sum / adapt_steps if adapt_steps else float("nan"),
+        comp_moving=components.moving_fraction(slot.plasticity),
+        comp_disp=(components.total(energy.get("disp")) / max(step, 1)
+                   if energy.get("disp") else float("nan")),
+        rejuvenated=touched, reinitialized=reinit, reinit_reverted=reverted,
+        adapt_mult=mult_sum / adapt_steps if adapt_steps else float("nan"),
         adapt_gate=gate_sum / adapt_steps if adapt_steps else float("nan"),
         adapt_steps=adapt_steps,
         depth=depth_sum / step if step else float("nan"), assoc=assoc_added)

@@ -7,9 +7,13 @@ rest of the window and its later steps are normalized down even when fresh
 signal arrives on it. Zeroing the moments of exactly those components re-arms
 them; every other component keeps its history.
 
-The trigger is the plasticity readout's free cousin — the component's share of
-the window's own gradient. A component that took no measurable share is the one
-whose stored moments describe gradients that are gone.
+The trigger is the component's *share* of the window's own gradient — the free
+near-miss to the plasticity readout (§6.1), not the displacement readout itself.
+Self-limiting, which is the point: the moments are a record of the gradient, so
+a component that took no measurable share is exactly the one whose stored
+moments describe gradients that are gone. That such a starved component can
+still be walking off those moments is why a moment reset is the right answer for
+it, and a reinit (§6.4) the answer for a different case.
 
 Re-arm, not wipe: the masked components' moments are scaled so their ratio
 lands back on a normal update size in the direction they already had, instead of
@@ -65,9 +69,21 @@ def _axis_and_rank(name: str, adapter: str) -> int | None:
     return None
 
 
+def _stem(name: str, adapter: str) -> str:
+    """The module name a parameter belongs to, from PEFT's full name."""
+    for kind in (".lora_A.", ".lora_B."):
+        suffix = f"{kind}{adapter}.weight"
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
 def rejuvenate(opt: torch.optim.Optimizer, pm, adapter: str,
-               mask: torch.Tensor) -> int:
+               mask: dict[str, torch.Tensor]) -> int:
     """Re-arm the components selected by `mask`: forget the spike, keep the lean.
+
+    `mask` is keyed by module: a component is a `(module, rank index)` pair, so
+    rank 3 of `q_proj` and rank 3 of `v_proj` are selected independently.
 
     A component is selected for having gone *quiet*. The mask removes history a
     different way: the first moment is divided by a factor `c` and the second
@@ -97,14 +113,15 @@ def rejuvenate(opt: torch.optim.Optimizer, pm, adapter: str,
     with torch.no_grad():
         for name, p in pm.named_parameters():
             axis = _axis_and_rank(name, adapter)
-            if axis is None or p.dim() != 2 or p.shape[axis] != mask.numel():
+            vector = mask.get(_stem(name, adapter)) if axis is not None else None
+            if vector is None or p.dim() != 2 or p.shape[axis] != vector.numel():
                 continue
             st = opt.state.get(p)
             if not st:
                 continue
             shape = [1] * p.dim()
-            shape[axis] = mask.numel()
-            select = mask.bool().view(shape)
+            shape[axis] = vector.numel()
+            select = vector.bool().view(shape)
             m, v = st.get("exp_avg"), st.get("exp_avg_sq")
             if m is None or v is None:
                 continue

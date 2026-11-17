@@ -12,13 +12,16 @@ grounded in the three papers this repo was built around, with the deltas marked
 
 ## 1. The failure model this design is built against
 
-Three distinct failure modes, often conflated, that need three distinct defenses:
+Four distinct failure modes, often conflated, that need distinct defenses. The
+first three are what sleepy-LMs is built for; the fourth is a behavioral failure
+of the same family, proposed in §6.8 and not yet implemented.
 
 | Failure | Mechanism | What makes it happen |
 | --- | --- | --- |
 | **Catastrophic forgetting** | Gradient on new data overwrites weights that encode old behavior | Any update with no anchor to the pre-update function |
 | **Perturbation / collapse** | Successive updates drift the function; each step is fine, the composition is not | Repeated in-place updates with no checkpoint to return to |
 | **Plasticity loss** | The network stops being *trainable*: dormant MLP units accumulate, attention heads go lazy, weight norm grows | Long uninterrupted training, even on stationary data |
+| **Response reuse** | A similar-looking request retrieves the last answer instead of the one asked for | Prompts that share a topic but differ in what they want (§6.8) |
 
 Key evidence, from arXiv:2606.24752 (Zyphra): plasticity loss is **not** caused by
 distribution shift, and **not** caused by stale Adam moments — they reproduced it
@@ -223,8 +226,9 @@ measurement.
    parameters train, absorbing the difference by reverse distillation.
 3. **Scale the delta**: `s < 1`. This is the `[Δ]` that matters most — the
    adapter has overfit whatever was salient recently and a full-strength merge
-   imports that bias into permanent weights. Also consider TIES-style
-   sign-conflict truncation on the delta before applying.
+   imports that bias into permanent weights. The measured importance (§6.1)
+   prunes whole rank components here — the ones no probe found a need for — and
+   TIES-style sign-conflict truncation then runs on what survives.
 4. **Gate** on: core-set KL vs pre-merge ≤ ε, probe AUC not worse, held-out
    golden set unchanged. Golden-set regressions veto.
 5. **Commit**: swap in `W'`, delete all slots, open `s0` fresh. Layer norm and
@@ -277,12 +281,16 @@ merge (§5), and if the merge does not help, the base needs unit resets.
 epochs, raise the replay ratio, lower LR. Note the direction of the confound —
 more capacity masks it and looks like it fixes it.
 
-### 6.1 Per-rank-component readouts
+### 6.1 Per-component readouts
 
 The signals above are per-slot scalars. A slot is not uniform, though: its delta
-is a sum of rank components, `dW = Σᵢ bᵢ aᵢᵀ`, and components differ in whether
-the model *needs* them and whether they can still *move*. Two 8-bit vectors on
-each `Slot` (`sleepy/components.py`):
+is a sum of rank components, `dW = Σᵢ bᵢ aᵢᵀ`, one sum per adapted module, and
+components differ in whether the model *needs* them and whether they can still
+*move*. The factors are drawn independently in each module, so a "component" is
+a `(module, rank index)` pair and not a rank index alone — rank 3 of the query
+projection has nothing to do with rank 3 of the MLP gate. Each readout is
+therefore a per-module vector (`sleepy/components.py`), with a parallel
+`measured` mask recording which entries were actually probed:
 
 * **Importance** — leave-one-out, `Iᵢ = max(0, L₋ᵢ − L_full)`, by actually
   removing component `i` from the forward pass (both factors zeroed, restored
@@ -290,15 +298,35 @@ each `Slot` (`sleepy/components.py`):
   `component_probes` components by output scale `‖bᵢ‖·‖aᵢ‖` — free, no forward
   — and unprobed components take the probed median, so *unmeasured* reads neutral
   rather than dead.
-* **Plasticity** — each component's share of the window's own gradient, from the
-  backward the step already ran. Free. A near-zero share means the component is
-  not absorbing anything whatever its delta looks like.
+* **Plasticity** — the component's *movement*, not its gradient: the relative
+  displacement its own factors took across the window,
+  `‖Δaᵢ‖/‖aᵢ‖ + ‖Δbᵢ‖/‖bᵢ‖`, from one clone before each step and one subtraction
+  after. Relative so it is scale-free; a factor at exactly zero contributes 0
+  rather than an unbounded ratio, so a fresh or just-reinitialized component
+  does not spike the window's peak.
+
+Importance and plasticity are **not interchangeable**, and the difference is the
+whole reason both exist. Importance says what a prune may drop and what a
+reinitialization must not throw away. Plasticity says only what has gone stale.
+Gradient *share* is a cheaper near-miss and is kept, but only for rejuvenation:
+under Adam an update is `~lr·m̂/√v̂` regardless of gradient size, so a component
+taking almost no gradient still walks roughly `lr` per step off its stored
+moments. Share measures whether signal arrives; movement measures whether the
+weight changes. A starved component is moving and a spiked one is frozen — share
+would call the first dead and the second alive, and a reinit is decided by the
+second.
 
 Both are written **after** the training step, on the delta as it landed: probing
-before training reads an all-zero fresh slot and scores everything 0. Scores are
-EMA-smoothed across sleeps (`component_alpha`), because one forward per
-component is noisy enough that a single unlucky probe would condemn a component
-the model needs.
+before training reads an all-zero fresh slot and scores everything 0.
+Importance is EMA-smoothed across sleeps (`component_alpha`), because one
+forward per component is noisy enough that a single unlucky probe would condemn a
+component the model needs. Plasticity is peak-normalised per window instead of
+smoothed: displacement has no absolute unit, so only the ordering within a
+window is meaningful. An all-zero window is still *recorded* rather than left
+absent: at lr 0, or on a window that moved nothing, zero displacement is a
+measurement and the stalest one there is, whereas a missing readout is not —
+`stale_mask` refuses a missing half, so dropping the zeros would make the one
+case a reinit exists for the one case it can never fire on.
 
 Two corrections to leave-one-out, both implemented:
 
@@ -314,7 +342,15 @@ telemetry. This one is consumed at merge (§5.2 step 3) as a *prune of the rank*
 `component_drop_fraction` lowest-scored share, plus anything below the absolute
 `component_floor`. Both exist because magnitude keeps exactly the wrong
 component — a large component that carries nothing is a big early direction,
-precisely what a threshold retains. The second consumer is §6.2.
+precisely what a threshold retains. `component_floor` defaults to **0.0**
+because the score is peak-normalised: in a slot whose components differ little,
+everything sits near the top and a floor above zero would prune the weakest for
+nothing but relative ordering. Only *measured* entries are eligible, so the
+median fill — 56 of 64 components at the default probe cap — cannot prune one on
+a placeholder. The second consumer is §6.2 and the third §6.4, which is where
+the *conjunction* of the two readouts matters: importance alone is a prune,
+plasticity alone is a re-arm, and only a component failing both is one a reinit
+can safely overwrite.
 
 **Pruning and truncation are two decisions.** TIES truncation (§5.2) zeroes the
 small-magnitude *elements* of a delta; component pruning zeroes whole *rank
@@ -356,11 +392,13 @@ masked, and the masked ones are corrected arithmetically instead.
 
 `sleepy/optimizer.py:rejuvenate` masks `exp_avg`/`exp_avg_sq` along the rank axis
 (axis 0 of `A` `(rank, d_in)`, axis 1 of `B` `(d_out, rank)` — names disambiguate,
-a square layer would not). The trigger is the `plasticity` share readout, not
-importance: a component that took no share of the window's own gradient is the
-one whose stored moments describe gradients that are gone. Parameters with no
-optimizer state are skipped, not initialized. `rejuvenate_at` fires it once,
-halfway through the budget.
+a square layer would not). The trigger is gradient *share* — the cheap inline
+readout, not the stored `plasticity` displacement and not importance: a
+component that took no share of the window's own gradient is the one whose
+stored moments describe gradients that are gone. (Share is enough here because
+rejuvenation repairs a starved moment, not a frozen direction — see §6.1.)
+Parameters with no optimizer state are skipped, not initialized.
+`rejuvenate_at` fires it once, halfway through the budget.
 
 **Off by default.** Paper 1 measured that stale Adam moments are *not* the cause
 of plasticity loss, so the reset has no demonstrated default benefit — it earns
@@ -376,13 +414,24 @@ continuous form — six float32 coefficients that shape every step:
 
 ```
 mult_i = clip(exp(a0 + a1·W_i + a2·S_i), 0.25, 2)      # per-component LR
-gate_i = 2·σ(b0 + b1·I_i + b2·G_i)                     # per-component trust
+gate_i = clip(2·σ(b0 + b1·I_i + b2·G_i), 0, 1)         # per-component trust
 ```
 
-`W` is the component's share of the slot's output magnitude (weight growth — a
-grown component is effectively shrunk by LayerNorm), `S` its share of the window
-gradient (§6.1 plasticity), `I` its measured importance, `G` how far this step's
-gradient exceeds the component's own history (a burst, not a level).
+`W` is the component's share of its module's output magnitude (weight growth — a
+grown component is effectively shrunk by LayerNorm), `S` its share of that
+module's window gradient (not its displacement — the controller is shaping the
+size of the next *update*, so signal arrival is the right input), `I` its
+measured importance, `G` how far this step's gradient exceeds the component's
+own history (a burst, not a level). Every feature is a per-module vector, the
+same `(module, rank)` identity as §6.1: rank 3 of `q_proj` and rank 3 of `v_proj`
+are different components, so averaging them first would apply one coefficient's
+opinion to both.
+
+**The gate only cuts.** The clip tops out at 1.0 — exactly the value the
+zero-coefficient identity `2σ(0)` sits at — and amplification is the
+multiplier's job (up to 2×). A gate term can then never silently double an
+already-doubled update, and a positive `b1`/`b2` cannot make a step bigger than
+the one the multiplier chose.
 
 **The gate lands on the optimizer's proposed update, not the gradient.** AdamW
 divides by the gradient's own magnitude, so a gradient-side gate is very nearly
@@ -395,12 +444,14 @@ Learning is one scalar reward — relative loss improvement — and it is measur
 **one batch against itself**, not across neighbouring batches. The sample change
 between two batches is far larger than anything a coefficient does, so a
 neighbouring batch's loss cannot say whether a coefficient helped. Each step's
-loss is therefore kept, and after the *next* step the same batch is re-forwarded
-and the pair is judged: one extra forward per step, after the step that is being
-judged has already landed (the judged shape is only final once `mult`/`gate` are
-known, so it cannot be the step's own). A sleep the commit gate refuses teaches
-the controller from a batch the model has just thrown away, so `commit` restores
-the pre-sleep coefficients on a refusal and `run` restores them on an exception.
+batch loss is taken before its update, the update lands, and that same batch is
+re-forwarded and judged: one extra forward per step, on the batch the step was
+actually trained on. The judgement has to come straight after the step's own
+`opt.step()`; re-forwarding a batch after the *next* step's update lands folds a
+second delta into the reading and blames these coefficients for a change they did
+not make. A sleep the commit gate refuses teaches the controller from a batch the
+model has just thrown away, so `commit` restores the pre-sleep coefficients on a
+refusal and `run` restores them on an exception.
 
 The reward is divided by its running mean magnitude; on real data relative loss
 movement is ~1e-3, which against a zero coefficient would otherwise take
@@ -415,7 +466,60 @@ learning, so it earns its place by measurement first. `adapt_mult`,
 `adapt_gate` and `adapt_steps` are reported per sleep; the first two near 1.0
 mean the controller ran and declined to do anything.
 
-### 6.4 Adaptive sleep depth
+### 6.4 Selective component reinitialization
+
+ReDo and RegS replace *weights*; §6.2 re-arms *optimizer moments*. Neither
+touches the mechanism a slot actually lost plasticity through. A component that
+stopped contributing is not fixed by a fresh moment schedule, because the
+direction its factors froze into is still the wrong one, and it is not fixed by
+rewriting the whole adapter, because most of the adapter is fine. It is fixed by
+drawing that one rank direction again and leaving the rest of the slot alone.
+
+**The trigger is the conjunction of §6.1's two readouts**, not either alone. A
+low-importance component is a prune: the slot may simply be better with it gone,
+and there is no reason to spend a direction replacing it. A low-plasticity
+component is a re-arm: something useful is frozen there and overwriting it
+throws away what the freeze bought. Only together — no importance to lose *and*
+no displacement to disturb — do they say "nothing is here and nothing is
+arriving", which is exactly the state a reinit replaces. A high-importance,
+low-plasticity component therefore survives by construction: however dead it
+looks, it fails the first test. Importance is compared absolutely (an
+un-normalised loss movement, so a byte is meaningful), plasticity relatively (it
+is peak-normalised per window, so only the ordering is); `reinit_importance`
+and `reinit_movement` are fractions of the byte scale and raising either one
+alone reinits more.
+
+**The reinit is per component and minimal**: the `aᵢ` row takes a fresh kaiming
+draw and the `bᵢ` column is zeroed — the same contract `ladder.zero_slot` applies
+to a whole slot. Zeroing `bᵢ` alone would already remove the component, but a
+zeroed `aᵢ` row has no direction for a gradient to establish, so the component
+would never start again. Every other row and column is left bit-identical.
+
+**It runs at the end of the sleep, and it is checked.** Running it there means
+it acts on the whole window's readouts rather than a half-formed one, and the
+sleep's own batch is already encoded. The loss on that batch is taken before and
+after on the same items — neighbouring batches differ by far more than a
+reinit — and a rise beyond `reinit_loss_tol` relative restores the saved
+factors exactly. Nothing has trained since, so the restore is total. Both
+counts are reported: `reinitialized` for what stood, `reinit_reverted` for what
+the check refused. A non-finite after-loss counts as a rise and reverts too: the
+rule restores on a *rise*, and NaN is not one, but a broken slot is not a
+successful reinit either.
+
+The slot's `effective_rank` is recomputed **after** the reinit, not with the
+other post-step readouts. Blanking components shrinks the space the delta spans,
+and that number is persisted and read by `_rank_bound` to decide whether a
+handoff to a higher rank could buy anything — measured before, it reports
+dimensions the slot no longer uses.
+
+**Off by default.** The readout has a genuine blind spot — a component whose
+carried knowledge the sleep's own batch does not exercise reads both
+unimportant and unmoving — and the reinit explicitly relies on that same batch
+as its only second opinion. Dying components starve their neighbours' gradient
+through interference, so on the right task the compounding benefit is real, but
+it is unmeasured here, which is the same bar rejuvenation was held to.
+
+### 6.5 Adaptive sleep depth
 
 §4.2 fixes N as a constant, but N=3 is right only for a batch the model has not
 converged on. On a batch it already fits, the extra passes move the loss by float
@@ -444,7 +548,7 @@ between cycles, and a depth that has collapsed re-widens slowly (one pass per
 step). When it works it is a straight throughput win; when it misfires it quietly
 turns a three-pass sleep into a plain fine-tune.
 
-### 6.5 Associative replay
+### 6.6 Associative replay
 
 The reservoir keeps the long tail but scatters it (§7): two facts about the same
 town are as likely to be replayed in different sleeps as together, so each is
@@ -469,9 +573,9 @@ together. It is also a *lexical* proxy: two passages on unrelated topics that
 share a stopword score above the floor, and a genuine paraphrase that shares no
 word scores below it.
 
-### 6.6 `[Δ]` What a restart keeps
+### 6.7 `[Δ]` What a restart keeps
 
-Everything measured in §6.1-§6.5 — the controller, its reward scale, the
+Everything measured in §6.1-§6.6 — the controller, its reward scale, the
 per-component readouts, the depth guess, each slot's state and failure count —
 used to be discarded on exit while the deltas those measurements had produced
 were kept. The model came back holding the result of a judgement it could no
@@ -483,9 +587,10 @@ land in the stock per-adapter layout (`<slot>/adapter_config.json` plus
 `adapter_model.safetensors`) and a caller with only `peft` gets them back with
 bare `load_adapter`. Nothing here invents a container for the weights. The
 state with no home in that layout is written after it: each slot's bookkeeping
-as `sleepy.json`, and the two readout vectors as extra tensors in its safetensors
-file — their length is the slot's rank, so the slot is the only object they can
-belong to. PEFT ignores unknown keys, so the file still loads stock; it does
+as `sleepy.json`, and the two readouts as extra tensors in its safetensors file,
+one per module under `sleepy.<readout>.<module>` — a component belongs to one
+module's rank, so both the module and the slot are implied by the key. PEFT
+ignores unknown keys, so the file still loads stock; it does
 mean a naive reader sees tensors it did not put there. The controller is
 model-wide, so it is written once beside `s0` and never repeated.
 
@@ -493,9 +598,11 @@ Three rules make load degrade instead of lie:
 
 * A slot directory absent entirely is left as the freshly attached no-op. A
   partial save is a shorter ladder, not a crash.
-* A readout of the wrong width is skipped, not copied or resized. The file was
-  written by some other code, and a wrong-shaped vector against the slot is
-  worse than none. The bookkeeping JSON is read under the same suppression.
+* A readout of the wrong width is skipped, not copied or resized — **per
+  module**, since a component belongs to one module's rank and a module with no
+  entry simply has no readout. The file was written by some other code, and a
+  wrong-shaped vector is worse than none. The bookkeeping JSON is read under the
+  same suppression.
 * Loaded weights make a slot live (`TRAINING`) *before* the metadata is read, so
   a weights file with no `sleepy.json` beside it restores a usable delta rather
   than a silent `EMPTY` one.
@@ -504,6 +611,90 @@ Three rules make load degrade instead of lie:
 valid. What it cannot restore is process state outside the ladder: the block
 verdict (§9.2), the buffer's in-memory pool, and any optimizer moments. A
 restart still re-asks the block A/B and reloads the log from tier 0.
+
+### 6.8 `[Δ]` Conversational repetition detection — proposed, not implemented
+
+A model trained for a long time on one pattern learns the cheap rule "a prompt
+about X gets the answer about X" and stops reading *what is being asked*. The
+failure is not repetition; repetition is usually correct. It is **reuse of the
+wrong response**: returning the definition when the request was for the
+mechanism, and the same answer again when the request was "simpler, please".
+
+Ordinary loss will not surface it. Both responses are fluent and on-topic, so
+perplexity on either is fine, and the ladder's readouts (§6.1) only look at
+whether components *move*. This needs its own subsystem for the same reason the
+others exist: it protects a different thing. §6.2 protects the ability to learn,
+§6.1 protects knowledge that still matters, this protects the mapping from
+request to response.
+
+**Why lexis is not enough.** Word overlap is the cheap feature and it fails in
+both directions. "Explain why gradient descent works" and "…does not work"
+overlap almost completely and want opposite answers; "What is photosynthesis"
+and "How do plants turn sunlight into energy" share no content word and want the
+same one. `assoc.py`'s hashed bigrams (§9.2) have the same blind spot and are
+already used for batch coherence, so they are one feature here and not the
+detector. (Word overlap stays the cheap feature, weighted toward content words
+and not counted per token — and it is most useful inverted: near-identical
+prompts with different answers are precisely the cases to look at.)
+
+**Detection, three measurements.** Score a (new prompt, current response) pair
+against the *previous* exchange:
+
+* `Sᵣ` — response similarity to the previous assistant turn (normalized exact
+  match ≥ a token n-gram ≥ a semantic comparison).
+* `Dᵢ` — requested-intent difference: action (explain / define / compare /
+  calculate / translate), subject and aspect, negation, constraints, and whether
+  the prompt refers back ("that", "again", "it").
+* `Gₐ` — answer-relevance gap: does the current response address *this* prompt's
+  intent, or only its topic.
+
+Risk `R = (1 − E) · Sᵣ · Dᵢ · Gₐ`, all in `[0, 1]`, where `E` is the confidence
+that repetition was **asked for** — an exact repeat ("word for word"), a recall
+("what did you say earlier") or a transform ("say that more simply") should not
+be penalized, and a negative instruction ("don't repeat yourself") should raise
+`R` rather than lower it. Every factor multiplies because each is a veto: a
+paraphrase requested verbatim has `Dᵢ` high and still must not count. `Gₐ` is the
+one that prevents false penalties — two genuinely different questions may have
+near-identical answers, and that is only a failure if the answer does not cover
+what was asked. Thresholds are to be calibrated on labelled exchanges, not
+assumed; the "50% overlap" figure is a starting guess and not a cutoff.
+
+**Correction is mandatory for training, optional for reporting.** Penalizing a
+stale answer only teaches the model not to repeat, not what to say instead, so a
+pair from stage 1 is *recorded* and only becomes a training pair once a
+correction exists. Sources in descending trust: an explicit user correction; a
+verified historical response that does match the new request; a frozen-teacher
+response, accepted only after a relevance check (the same `Gₐ` on the teacher's
+text). With no correction the candidate is metadata, never a penalty.
+
+**Preference, not a second loss over the same string.** The training signal is
+pairwise:
+
+`L = −log σ(β · [log P(y_correct | x) − log P(y_old | x)])`
+
+over the same new prompt `x`. Both sides are scored, so the working direction is
+"prefer the one that answers" rather than "move away from anything familiar".
+The adapter's own `log P` is the reference, so this needs no second model at
+inference; `y_old` is only available from tier 0.
+
+**What tier 0 is missing.** `Item` is a single message and the reservoir evicts
+messages, not exchanges (DESIGN §3, §7) — two turns of one exchange can be
+evicted independently, and `select()` (§7) can draw half an exchange. A pair
+detector therefore cannot be built on `Item` as it stands. Needed: an exchange
+identifier on `Item`, and exchange-granular sampling and eviction for anything
+the repetition path replays. `role` is a free string today, so a session that
+does not alternate user/assistant is silently unpairable — the pairing has to be
+by exchange id, not by "the next item".
+
+**Cost and shape.** All of it is sleep-time. `L` is one extra term on the sleep's
+own optimizer, weighted small (`~0.02`) so the replay loss keeps dominating —
+otherwise the slot fits the preference instead of the content. It needs two
+extra forwards per pair (no teacher, no second model at inference), so it is
+capped by a pair count, not run over the whole history. It is a delta like any
+other: the commit gate sees it and a refusal rolls it back with the rest. Staged:
+detection and reporting first (`repetition_guard` off), then correction quality,
+then the `L` term. Default off until detection is shown to flag real failures on
+real transcripts.
 
 ## 7. Replay mix
 
@@ -657,13 +848,19 @@ Resolved, with the evidence that closed each one:
   `block_every` sleeps rather than resuming it. That is the safe direction —
   a stale acceptance never outlives the model it was measured on — but it also
   means the cost is paid again after every restart.
-* **Adaptive depth's "converged" is a proxy.** §6.4 compares a batch's loss
+* **A reinit is judged on the batch that also judged the readout.** §6.4
+  restores on a loss rise, but that same batch is what decided the components
+  were dead, so a component whose knowledge the batch never exercises reads both
+  unimportant and unmoving and passes the check unchanged. The two opinions are
+  not independent. A held-out batch would be the fix and costs a second encode
+  and two forwards per window.
+* **Adaptive depth's "converged" is a proxy.** §6.5 compares a batch's loss
   across steps, which is a loss movement, not a measurement that the batch *is*
   converged; a batch whose loss oscillates reads as converged and loses a pass it
   needed. Against an evicted-then-reloaded batch the comparison is also across
   different items, since `batches_of` is rebuilt per sleep. The whole rule moves
   at one pass per step, so a bad first guess re-widens slowly.
-* **Association is lexical and hashed.** §6.5 scores shared words, so a
+* **Association is lexical and hashed.** §6.6 scores shared words, so a
   paraphrase sharing no word scores below the floor and two unrelated passages
   sharing a stopword score above it. 4096 buckets also collide: two distinct
   bigrams can land on one and inflate a similarity. The neighbours are appended
@@ -678,6 +875,10 @@ Resolved, with the evidence that closed each one:
   interleave or vanish and a torn tail line is skipped on load. Two `Buffer`
   objects over one path still hold independent in-memory pools, so each process's
   view is stale relative to the other's writes until it reloads.
+* **§6.8 is prose.** No `repetition.py` exists, so nothing detects response
+  reuse, and the exchange id it needs is not on `Item`. The proposal also
+  assumes the response is *in* tier 0: a deployment that logs only user turns
+  has no `y_old` to compare against.
 * **Only the merge residual is exception-safe, not the process.** The mutate →
   gate window now rolls back in-memory state, but nothing is written to disk: a
   kill -9 between the base write and the gate still loses the commit, because the
@@ -727,11 +928,12 @@ Resolved, with the evidence that closed each one:
 
 `sleepy/` implements the machinery against SmolLM2-135M on CPU: buffer,
 one-probe importance sampling, N-pass loop with gradient accumulation, rank
-ladder + handoff, KL/trust-region anchor, merge protocol, per-rank-component
-importance/plasticity readouts feeding the merge, diffusion-block
-training with its matched-step A/B, selective optimizer rejuvenation, adaptive
-plasticity control, adaptive sleep depth, ladder save/load, and the full
-instrumentation table.
+ladder + handoff, KL/trust-region anchor, merge protocol, per-module
+importance/displacement readouts feeding the merge prune and the selective
+reinit, diffusion-block training with its matched-step A/B, selective optimizer
+rejuvenation, adaptive plasticity control, adaptive sleep depth, ladder
+save/load, and the full instrumentation table. Conversational repetition
+detection (§6.8) is designed here and not yet built.
 `python -m sleepy.demo` runs a multi-session scenario with
 a synthetic knowledge stream and prints the signals above so the schedule can be
 watched end to end. Numbers from a 135M CPU run are for *shape* only.

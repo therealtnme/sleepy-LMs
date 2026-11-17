@@ -54,6 +54,14 @@ def _warm_opt(pm, ladder, slot_name, steps=1, levels=None):
 SPIKE = [10.0] * 3 + [0.01] * 37
 
 
+def _mask(pm, values):
+    """The same selection in every module. A component is a `(module, rank index)`
+    pair, so the mask is keyed by module — a flat tensor selects by rank index
+    alone, which means different components in different modules."""
+    t = torch.as_tensor(values, dtype=torch.float32)
+    return {n: t for n, _ in adapted_modules(pm)}
+
+
 def _ratio(st, betas=(0.9, 0.999)):
     """The corrected update size the stored moments would produce, in units of lr."""
     t = int(st["step"].item()) if torch.is_tensor(st["step"]) else int(st["step"])
@@ -69,8 +77,7 @@ def test_rejuvenation_reseeds_only_the_masked_component(pm, ladder):
     opt = _warm_opt(pm, ladder, "s2", steps=len(SPIKE), levels=SPIKE)
     before = {(n, key): opt.state[getattr(mod, key)["s2"].weight]["exp_avg"].clone()
               for n, mod in adapted_modules(pm) for key in ("lora_A", "lora_B")}
-    mask = torch.tensor([1.0, 0.0])
-    assert optimizer.rejuvenate(opt, pm, "s2", mask) > 0
+    assert optimizer.rejuvenate(opt, pm, "s2", _mask(pm, [1.0, 0.0])) > 0
 
     for n, mod in adapted_modules(pm):
         for key, axis in (("lora_A", 0), ("lora_B", 1)):
@@ -87,8 +94,7 @@ def test_rejuvenation_reseeds_only_the_masked_component(pm, ladder):
 def test_rejuvenation_uses_the_rank_axis_of_a_layout(pm, ladder):
     """A is (rank, d_in): masking axis 0 there, axis 1 on B."""
     opt = _warm_opt(pm, ladder, "s2", steps=len(SPIKE), levels=SPIKE)
-    mask = torch.tensor([1.0, 0.0])
-    optimizer.rejuvenate(opt, pm, "s2", mask)
+    optimizer.rejuvenate(opt, pm, "s2", _mask(pm, [1.0, 0.0]))
 
     for _, mod in adapted_modules(pm):
         st = opt.state[mod.lora_A["s2"].weight]
@@ -102,7 +108,7 @@ def test_rejuvenation_keeps_the_first_moment(pm, ladder):
     before = {n: opt.state[mod.lora_B["s2"].weight]["exp_avg"].clone()
               for n, mod in adapted_modules(pm)}
 
-    optimizer.rejuvenate(opt, pm, "s2", torch.tensor([1.0, 1.0]))
+    optimizer.rejuvenate(opt, pm, "s2", _mask(pm, [1.0, 1.0]))
 
     for n, mod in adapted_modules(pm):
         after = opt.state[mod.lora_B["s2"].weight]["exp_avg"]
@@ -124,7 +130,7 @@ def test_a_rearmed_step_is_normal_sized(pm, ladder):
     opt = _warm_opt(pm, ladder, "s2", steps=len(SPIKE), levels=SPIKE)
     p = next(mod.lora_A["s2"].weight for _, mod in adapted_modules(pm))
     q = next(mod.lora_B["s2"].weight for _, mod in adapted_modules(pm))
-    optimizer.rejuvenate(opt, pm, "s2", torch.tensor([1.0, 1.0]))
+    optimizer.rejuvenate(opt, pm, "s2", _mask(pm, [1.0, 1.0]))
 
     moved = {}
     for t in (p, q):
@@ -147,7 +153,7 @@ def test_the_rescale_targets_the_step_the_weight_will_see(pm, ladder):
     """
     opt = _warm_opt(pm, ladder, "s2", steps=len(SPIKE), levels=SPIKE)
     p = next(mod.lora_A["s2"].weight for _, mod in adapted_modules(pm))
-    optimizer.rejuvenate(opt, pm, "s2", torch.tensor([1.0, 1.0]))
+    optimizer.rejuvenate(opt, pm, "s2", _mask(pm, [1.0, 1.0]))
 
     p.grad = torch.full_like(p, 1.0)
     before = p.detach().clone()
@@ -165,7 +171,7 @@ def test_rejuvenation_skips_parameters_with_no_state(pm, ladder):
     opt = torch.optim.AdamW([p for p in pm.parameters() if p.requires_grad])
 
     assert not opt.state
-    assert optimizer.rejuvenate(opt, pm, "s2", torch.ones(2)) == 0
+    assert optimizer.rejuvenate(opt, pm, "s2", _mask(pm, [1.0, 1.0])) == 0
 
 
 def test_rejuvenation_ignores_other_slots(pm, ladder):
@@ -174,7 +180,7 @@ def test_rejuvenation_ignores_other_slots(pm, ladder):
     before = {n: opt.state[mod.lora_A["s2"].weight]["exp_avg"].clone()
               for n, mod in adapted_modules(pm)}
 
-    assert optimizer.rejuvenate(opt, pm, "s9", torch.ones(2)) == 0
+    assert optimizer.rejuvenate(opt, pm, "s9", _mask(pm, [1.0, 1.0])) == 0
     for n, mod in adapted_modules(pm):
         assert torch.equal(opt.state[mod.lora_A["s2"].weight]["exp_avg"], before[n])
 

@@ -29,25 +29,39 @@ def _cfg(**kw):
     return SleepConfig(**base)
 
 
+def _one(*vectors):
+    """Every controller feature is per module; one synthetic module is enough for
+    the arithmetic, which is the same in every module."""
+    return tuple({"m": torch.as_tensor(v, dtype=torch.float32)} for v in vectors)
+
+
+def _flat(readout):
+    return readout["m"]
+
+
+def _per(pm, vector):
+    """A per-module dict of the same vector, for the calls that touch a model."""
+    return {n: torch.as_tensor(vector, dtype=torch.float32) for n, _ in adapted_modules(pm)}
+
+
 def test_zero_coefficients_are_the_identity():
     ctrl = controller.Controller()
-    w, s = torch.tensor([0.5, 0.5]), torch.tensor([0.3, 0.7])
-    i, g = torch.tensor([0.9, 0.1]), torch.tensor([2.0, 0.5])
+    w, s, i, g = _one([0.5, 0.5], [0.3, 0.7], [0.9, 0.1], [2.0, 0.5])
 
-    assert torch.allclose(ctrl.multiplier(w, s), torch.ones(2))
-    assert torch.allclose(ctrl.gate(i, g), torch.ones(2), atol=1e-6)
+    assert torch.allclose(_flat(ctrl.multiplier(w, s)), torch.ones(2))
+    assert torch.allclose(_flat(ctrl.gate(i, g)), torch.ones(2), atol=1e-6)
 
 
 def test_multiplier_and_gate_are_clipped():
     ctrl = controller.Controller(lr=(5.0, 5.0, 5.0), trust=(-99.0, -99.0, -99.0))
-    mult = ctrl.multiplier(torch.ones(2), torch.ones(2))
-    gate = ctrl.gate(torch.ones(2), torch.ones(2))
+    mult = ctrl.multiplier(*_one([1.0, 1.0], [1.0, 1.0]))
+    gate = ctrl.gate(*_one([1.0, 1.0], [1.0, 1.0]))
 
-    assert float(mult.max()) == pytest.approx(controller.MULT_CLIP[1])
-    assert float(gate.min()) == pytest.approx(controller.GATE_CLIP[0], abs=1e-6)
+    assert float(_flat(mult).max()) == pytest.approx(controller.MULT_CLIP[1])
+    assert float(_flat(gate).min()) == pytest.approx(controller.GATE_CLIP[0], abs=1e-6)
 
     ctrl = controller.Controller(lr=(-5.0, -5.0, -5.0))
-    assert float(ctrl.multiplier(torch.ones(1), torch.ones(1)).min()) == pytest.approx(
+    assert float(_flat(ctrl.multiplier(*_one([1.0], [1.0]))).min()) == pytest.approx(
         controller.MULT_CLIP[0])
 
 
@@ -60,8 +74,8 @@ def test_apply_lands_on_the_rank_axis(pm, ladder):
             mod.lora_A["s2"].weight.add_(1.0)
             mod.lora_B["s2"].weight.add_(1.0)
 
-    scale = torch.tensor([2.0, 0.5])          # component 0 doubled, 1 halved
-    controller.apply(pm, "s2", snap, scale, torch.ones(2))
+    mult = _per(pm, [2.0, 0.5])               # component 0 doubled, 1 halved
+    controller.apply(pm, "s2", snap, mult, _per(pm, [1.0, 1.0]))
 
     for name, mod in adapted_modules(pm):
         a, b = mod.lora_A["s2"].weight, mod.lora_B["s2"].weight
@@ -86,8 +100,7 @@ def test_apply_is_the_identity_at_unit_scale(pm, ladder):
             mod.lora_B["s2"].weight.add_(0.25)
     before = {n: p.detach().clone() for n, p in pm.named_parameters()}
 
-    controller.apply(pm, "s2", before, torch.ones(2),
-                     torch.ones(2))
+    controller.apply(pm, "s2", before, _per(pm, [1.0, 1.0]), _per(pm, [1.0, 1.0]))
 
     for n, p in pm.named_parameters():
         assert torch.allclose(p, before[n], atol=1e-7)
@@ -112,8 +125,7 @@ def test_reward_is_normalized_to_its_own_scale():
 
 def test_learning_moves_toward_a_feature_on_a_good_step():
     ctrl = controller.Controller(eta=0.5, decay=0.0)
-    w, s = torch.tensor([1.0, 0.0]), torch.zeros(2)
-    imp, burst = torch.zeros(2), torch.zeros(2)
+    w, s, imp, burst = _one([1.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0])
     mult, gate = ctrl.weights(w, s, imp, burst)
 
     ctrl.learn(1.0, w, s, imp, burst, mult, gate)
@@ -128,8 +140,7 @@ def test_learning_moves_toward_a_feature_on_a_good_step():
 
 def test_a_bad_step_moves_coefficients_down():
     ctrl = controller.Controller(eta=0.5, decay=0.0)
-    w, s = torch.ones(2), torch.zeros(2)
-    imp, burst = torch.zeros(2), torch.zeros(2)
+    w, s, imp, burst = _one([1.0, 1.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0])
     mult, gate = ctrl.weights(w, s, imp, burst)
 
     ctrl.learn(-1.0, w, s, imp, burst, mult, gate)
@@ -139,7 +150,7 @@ def test_a_bad_step_moves_coefficients_down():
 
 def test_decay_returns_untouched_coefficients_to_neutral():
     ctrl = controller.Controller(lr=(0.9, 0.0, 0.0), trust=(0.0, 0.0, 0.9), decay=0.5)
-    z = torch.zeros(2)
+    z, = _one([0.0, 0.0])
     mult, gate = ctrl.weights(z, z, z, z)
 
     ctrl.learn(0.0, z, z, z, z, mult, gate)   # reward 0 is a no-op...
@@ -182,12 +193,16 @@ def test_the_reward_is_measured_on_one_batch(pm, ladder, buffer, monkeypatch):
     The batches differ by more than a coefficient does, so a retrodiction on a
     *different* batch cannot say whether the coefficient helped. Here the
     encoder is pinned so each step's batch is identified by its tokens: the
-    judged batch's ids must equal the ids the loss was taken on.
+    judged batch's ids must equal the ids the loss was taken on, and the judged
+    forward must come after that batch's own update — a forward taken later
+    would fold the next step's delta into the reading.
     """
     calls: list[tuple[tuple[int, ...], float | None]] = []   # batch and loss, if any
     judged: list[tuple[float, float, int]] = []              # (prev, now, index)
+    steps: list[int] = []                                    # call index of each update
     real_forward = pm.forward
     real_reward = controller.Controller.reward
+    real_step = torch.optim.AdamW.step
 
     def spy_forward(*a, **kw):
         out = real_forward(*a, **kw)
@@ -199,23 +214,30 @@ def test_the_reward_is_measured_on_one_batch(pm, ladder, buffer, monkeypatch):
         judged.append((prev, now, len(calls) - 1))
         return real_reward(self, prev, now)
 
+    def spy_step(self, *a, **kw):
+        steps.append(len(calls))                             # before the next forward
+        return real_step(self, *a, **kw)
+
     monkeypatch.setattr(pm, "forward", spy_forward)
     monkeypatch.setattr(controller.Controller, "reward", spy_reward)
-    run(pm, ladder, buffer, ladder.slots[2], _cfg(adapt=True, budget_steps=4))
+    monkeypatch.setattr(torch.optim.AdamW, "step", spy_step)
+    rep = run(pm, ladder, buffer, ladder.slots[2], _cfg(adapt=True, budget_steps=4))
 
-    # Step 0 trains unjudged; each later step trains, then re-forwards the
-    # *previous* step's batch and learns from that batch's before/after pair.
-    # So the "before" must be an earlier forward of the same batch, the "after"
-    # this judged forward, and the pair must not be the current step's batch.
-    assert len(judged) == 3
+    # Every step trains, lands its delta, then re-forwards that same batch and
+    # learns from its before/after pair. The judged forward must therefore sit
+    # directly behind its own training forward, with only that step's update in
+    # between — the old lag judged a batch while the *next* batch's update had
+    # already run.
+    assert len(judged) == 4, (
+        f"judged {len(judged)} of {rep.adapt_steps} adapted steps "
+        f"(truncated={rep.truncated}, steps={rep.steps}, forwards={len(calls)})")
     for prev, now, j in judged:
         batch, loss_now = calls[j]
         assert now == pytest.approx(loss_now)
+        assert calls[j - 1][0] == batch, "the judged forward is not the step's own batch"
+        assert steps.count(j) == 1, "judged without an update in between"
         same = [(n, bid) for bid, n in calls[:j] if bid == batch and n is not None]
-        assert same, "the judged batch was never seen before the step"
         assert prev == pytest.approx(same[-1][0])       # its loss before the step
-        current = [bid for bid, n in calls[:j] if n is not None][-1]
-        assert current != batch                         # not the judging step's
 
 
 def test_a_rejected_commit_keeps_the_old_coefficients(pm, ladder, buffer):

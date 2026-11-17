@@ -117,6 +117,10 @@ def main() -> None:
                     help="associative replay: pull an item's lexical neighbours into "
                          "the same batch; trades diversity for topic coherence, so "
                          "off by default")
+    ap.add_argument("--reinit", choices=("on", "off"), default="off",
+                    help="blank rank components that are neither needed nor still "
+                         "moving, reverting when the check batch worsens; needs "
+                         "component readouts, so off by default")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -145,7 +149,7 @@ def main() -> None:
     cfg = SleepConfig(tokenizer=tok, seq_len=args.seq_len, passes=args.passes,
                       budget_steps=args.budget, seed=args.seed,
                       adapt=args.adapt == "on", depth_adapt=args.depth == "on",
-                      assoc=args.assoc == "on")
+                      assoc=args.assoc == "on", reinit=args.reinit == "on")
     sched = Schedule(min_items=args.min_items, max_items=CAPACITY, min_hours=0.0,
                      merge_after_slots=3, stall_window=2)
     mcfg = MergeConfig(inner_steps=12, gate_kl_max=0.25)

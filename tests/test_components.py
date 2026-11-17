@@ -28,12 +28,45 @@ def _batch(buffer, cfg=None):
     return encode(cfg or _cfg(), render(buffer.all()[:4]))
 
 
-def test_importance_is_rank_long_and_bit_eight(pm, ladder, buffer):
-    open_slot(pm, ladder, ladder.slots[0])
-    imp = components.measure(pm, "s0", _batch(buffer))
+def _readout(slot, key="importance"):
+    """The slot's per-module readout, which is a dict not a vector."""
+    return getattr(slot, key)
 
-    assert imp.shape == (1,)                    # s0 has rank 1
-    assert imp.dtype is torch.uint8
+
+def _peak(readout):
+    return max(int(t.max()) for t in readout.values() if t.numel())
+
+
+def _zero(readout):
+    for t in readout.values():
+        t[:] = 0
+
+
+def _modules(pm):
+    """Every adapted module's full name. `ladder.modules` holds the short target
+    names, but readouts key by the full path PEFT assigned — two of these layers
+    carry `v_proj`, so the short name is not even unique."""
+    return {n for n, _ in adapted_modules(pm)}
+
+
+def _components(pm, rank):
+    """How many components a selection covers: rank of them in every module.
+    Rank index alone is not an identity, so the count is per module."""
+    return len(_modules(pm)) * rank
+
+
+def test_importance_is_one_rank_long_vector_per_module(pm, ladder, buffer):
+    """Rank index is not a component identity: `q_proj` rank 0 and `v_proj` rank
+    0 are unrelated, so the readout keeps one vector per module."""
+    open_slot(pm, ladder, ladder.slots[0])
+    scores, measured = components.measure(pm, "s0", _batch(buffer))
+
+    assert set(scores) == _modules(pm)
+    for t in scores.values():
+        assert t.shape == (1,)                  # s0 has rank 1
+        assert t.dtype is torch.uint8
+    for t in measured.values():
+        assert t.dtype is torch.bool
 
 
 def test_measure_restores_the_delta_and_training_mode(pm, ladder, buffer):
@@ -68,18 +101,32 @@ def test_hidden_component_is_found(pm, ladder, buffer):
             if "s2" in mod.lora_B:
                 mod.lora_B["s2"].weight[:, 1] = 0.0
                 mod.lora_A["s2"].weight[1, :] = 0.0
-    live = components.measure(pm, "s2", _batch(buffer))
+    scores, _ = components.measure(pm, "s2", _batch(buffer))
 
     assert slot.importance is not None
-    assert int(live.argmax()) == 0
+    for name, t in scores.items():
+        assert int(t.argmax()) == 0, name
 
 
-def test_plasticity_shares_sum_to_one(pm, ladder, buffer):
+def test_plasticity_is_a_peak_normalised_uint8_readout(pm, ladder, buffer):
     run(pm, ladder, buffer, ladder.slots[2], _cfg())
     plastic = ladder.slots[2].plasticity
 
-    assert plastic is not None and plastic.dtype is torch.uint8
-    assert plastic.numel() == 2
+    assert plastic is not None and set(plastic) == _modules(pm)
+    for t in plastic.values():
+        assert t.dtype is torch.uint8 and t.shape == (2,)
+    # Peak-normalised, not a share: the largest displacement pins to the byte
+    # ceiling, so a component's value is comparable within this window only —
+    # and the peak is shared across modules so a byte means the same everywhere.
+    assert _peak(plastic) == int(components.MAX)
+
+
+def test_readouts_keep_one_shared_peak_across_modules(pm, ladder, buffer):
+    """A byte threshold must mean the same thing in every module, so the peak
+    normalisation is shared rather than taken per module."""
+    run(pm, ladder, buffer, ladder.slots[2], _cfg())
+
+    assert _peak(ladder.slots[2].plasticity) == int(components.MAX)
 
 
 def test_release_clears_the_readouts(pm, ladder, buffer):
@@ -90,6 +137,7 @@ def test_release_clears_the_readouts(pm, ladder, buffer):
     release_slot(pm, ladder, ladder.slots[2])
 
     assert ladder.slots[2].importance is None and ladder.slots[2].plasticity is None
+    assert ladder.slots[2].measured is None
 
 
 def test_keep_mask_drops_the_lowest_scores():
@@ -113,13 +161,22 @@ def test_smooth_weights_the_new_readout():
     assert components.smooth(prev, new, 0.5).tolist() == [100, 100]
 
 
-def _fake_slot(pm, ladder, importance):
-    """An attached rank-2 slot named `s9` carrying the given readout."""
+def _fake_slot(pm, ladder, importance, measured=True):
+    """An attached rank-2 slot named `s9` carrying the given readout.
+
+    The readout is replicated to every adapted module — the merge decides per
+    module, and a scenario has no reason to differ between them unless it says
+    so.
+    """
     from sleepy.ladder import Slot
 
     pm.add_adapter("s9", ladder.config(2))
     s = Slot(name="s9", rank=2)
-    s.importance = torch.tensor(importance, dtype=torch.uint8)
+    v = torch.tensor(importance, dtype=torch.uint8)
+    s.importance = {n: v.clone() for n, _ in adapted_modules(pm)}
+    if measured is not None:
+        m = torch.full((2,), measured, dtype=torch.bool)
+        s.measured = {n: m.clone() for n, _ in adapted_modules(pm)}
     return s
 
 
@@ -181,7 +238,7 @@ def test_truncation_is_independent_of_pruning(pm, ladder):
 
 
 def test_a_prune_that_would_empty_the_slot_falls_back_to_the_rank(pm, ladder):
-    slot = _fake_slot(pm, ladder, [0, 0])
+    slot = _fake_slot(pm, ladder, [0, 0], measured=None)   # no mask to exempt with
 
     deltas = compute_deltas(pm, "s9", MergeConfig(sign_conflict=0.0,
                                                   component_drop_fraction=0.5),
@@ -195,8 +252,8 @@ def test_a_prune_that_would_empty_the_slot_falls_back_to_the_rank(pm, ladder):
                               atol=1e-6)
 
 
-def test_component_floor_drops_unmeasured_components(pm, ladder):
-    """A component that never scored is skipped even inside the kept mass."""
+def test_component_floor_drops_dead_components(pm, ladder):
+    """A component that scored near zero is skipped even inside the kept mass."""
     slot = _fake_slot(pm, ladder, [255, 10])
     with torch.no_grad():
         for _, mod in adapted_modules(pm):
@@ -216,6 +273,38 @@ def test_component_floor_drops_unmeasured_components(pm, ladder):
         # The floor strips component 1 alone; without it both components land.
         assert torch.allclose(kept[name], (b[:, 0:1] @ a[0:1]) * scale, atol=1e-6)
         assert torch.allclose(loose[name], (b @ a) * scale, atol=1e-6)
+
+
+def test_the_floor_leaves_an_unmeasured_component_alone(pm, ladder):
+    """The unprobed fill is a placeholder, not a score: a fill under the floor
+    must not prune on it. Flipping the mask alone drops the component, so it is
+    the mask and not the number doing the work."""
+    # Component 1 carries the low value but was never probed. Perturbing only
+    # the mask, with the same scores, is what separates the two outcomes.
+    slot = _fake_slot(pm, ladder, [255, 0], measured=False)
+    slot.measured = {n: torch.tensor([True, False]) for n, _ in adapted_modules(pm)}
+    with torch.no_grad():
+        for _, mod in adapted_modules(pm):
+            mod.lora_A["s9"].weight.fill_(1.0)
+            mod.lora_B["s9"].weight.fill_(1.0)
+
+    probed = compute_deltas(pm, "s9", MergeConfig(sign_conflict=0.0,
+                                                  delta_scale=1.0), slot, 0.5)
+    slot.measured = {n: torch.ones(2, dtype=torch.bool)
+                     for n, _ in adapted_modules(pm)}
+    both = compute_deltas(pm, "s9", MergeConfig(sign_conflict=0.0,
+                                                delta_scale=1.0), slot, 0.5)
+
+    for name, mod in adapted_modules(pm):
+        b = mod.lora_B["s9"].weight.float()
+        a = mod.lora_A["s9"].weight.float()
+        scale = mod.scaling["s9"]
+        # Only component 0 was probed: the floor's zero on component 1 is a
+        # placeholder, so both components survive.
+        assert torch.allclose(probed[name], (b @ a) * scale, atol=1e-6)
+        # With the mask claiming both were measured, the zero is a score and
+        # the floor acts on it.
+        assert torch.allclose(both[name], (b[:, 0:1] @ a[0:1]) * scale, atol=1e-6)
 
 
 def test_component_bases_are_empty_without_frozen_slots(pm):
@@ -278,7 +367,7 @@ def test_important_component_survives_a_frozen_slot_session(pm, ladder, buffer):
     run(pm, ladder, buffer, ladder.slots[2], _cfg())
 
     assert ladder.slots[0].importance is not None
-    assert int(ladder.slots[0].importance.max()) > 0
+    assert _peak(ladder.slots[0].importance) > 0
 
 
 def test_measure_handles_an_empty_selection(pm, ladder, buffer):
@@ -286,3 +375,345 @@ def test_measure_handles_an_empty_selection(pm, ladder, buffer):
 
     assert components.measure(pm, "s2", _batch(buffer)) is not None
     assert components.live_fraction(None) != components.live_fraction(None)
+
+
+def test_displacement_is_relative_to_the_component_it_moved(pm, ladder):
+    """The same relative move reads the same at any absolute scale.
+
+    An absolute delta would call a large component frozen for moving as far as
+    a small one. This is the property that makes the readout a displacement
+    rather than a step size — and the vector is one entry per component, not per
+    output or input feature.
+    """
+    _fake_slot(pm, ladder, [255, 255])
+
+    def reading(scale):
+        with torch.no_grad():
+            for _, mod in adapted_modules(pm):
+                mod.lora_A["s9"].weight.fill_(scale)
+                mod.lora_B["s9"].weight.fill_(scale)
+        held = components.snapshot(pm, "s9")
+        with torch.no_grad():
+            for _, mod in adapted_modules(pm):
+                mod.lora_A["s9"].weight[0, 0] += scale   # component 0 only
+        return components.displacement(pm, "s9", held)
+
+    got = reading(1.0)
+    same = reading(10.0)
+
+    assert set(got) == _modules(pm)
+    for name, t in got.items():
+        assert t.numel() == 2
+        assert float(t[0]) > 0 and float(t[1]) == 0
+        assert torch.allclose(t, same[name])
+
+
+def test_displacement_of_a_zero_factor_is_zero_not_infinite(pm, ladder):
+    """A fresh (or just-reinitialized) component must not spike the reading.
+
+    Its denominators start at exactly 0, so a bare ratio is infinite and
+    flattens every other component by comparison once the window is
+    peak-normalised.
+    """
+    _fake_slot(pm, ladder, [255, 0])
+    with torch.no_grad():
+        for _, mod in adapted_modules(pm):
+            mod.lora_A["s9"].weight.fill_(1.0)
+            mod.lora_B["s9"].weight.fill_(1.0)
+            mod.lora_A["s9"].weight[1] = 0.0
+            mod.lora_B["s9"].weight[:, 1] = 0.0
+    held = components.snapshot(pm, "s9")
+    with torch.no_grad():
+        for _, mod in adapted_modules(pm):
+            mod.lora_A["s9"].weight[1].fill_(1.0)
+            mod.lora_B["s9"].weight[:, 1].fill_(1.0)
+
+    got = components.displacement(pm, "s9", held)
+
+    for name, t in got.items():
+        assert torch.isfinite(t).all(), name
+        assert float(t[1]) == 0
+
+
+def test_displacement_counts_both_factors(pm, ladder):
+    """`a` and `b` are both measured, and their readings add.
+
+    Moving one factor alone must register, and moving both must register the
+    sum — reporting one factor would halve every reading and make movement on
+    the other invisible.
+    """
+    _fake_slot(pm, ladder, [255, 255])
+
+    def reading(*factors):
+        with torch.no_grad():
+            for _, mod in adapted_modules(pm):
+                mod.lora_A["s9"].weight.fill_(1.0)
+                mod.lora_B["s9"].weight.fill_(1.0)
+        held = components.snapshot(pm, "s9")
+        with torch.no_grad():
+            for _, mod in adapted_modules(pm):
+                if "a" in factors:
+                    mod.lora_A["s9"].weight[0, 0] += 1.0
+                if "b" in factors:
+                    mod.lora_B["s9"].weight[0, 0] += 1.0
+        return components.displacement(pm, "s9", held)
+
+    a_only, b_only, both = reading("a"), reading("b"), reading("a", "b")
+
+    for name in a_only:
+        assert float(a_only[name][0]) > 0 and float(b_only[name][0]) > 0
+        assert torch.allclose(a_only[name] + b_only[name], both[name])
+        for got in (a_only, b_only, both):
+            assert float(got[name][1]) == 0.0
+
+
+def test_stale_mask_is_a_conjunction():
+    """Both tests must fail for a component to qualify."""
+    imp = {"m": torch.tensor([0, 0, 255, 255], dtype=torch.uint8)}   # low, low, high, high
+    pla = {"m": torch.tensor([0, 255, 0, 255], dtype=torch.uint8)}   # low, high, low, high
+
+    mask = components.stale_mask(imp, pla, None)
+
+    assert mask["m"].tolist() == [True, False, False, False]
+
+
+def test_stale_mask_is_decided_per_module():
+    """One module's high importance must not rescue another module's dead
+    component. Flat vectors would have indexed these together."""
+    imp = {"a": torch.tensor([0], dtype=torch.uint8),
+           "b": torch.tensor([255], dtype=torch.uint8)}
+    pla = {"a": torch.tensor([0], dtype=torch.uint8),
+           "b": torch.tensor([0], dtype=torch.uint8)}
+
+    mask = components.stale_mask(imp, pla, None)
+
+    assert set(mask) == {"a"}                   # `b` is frozen but still needed
+
+
+def test_stale_mask_preserves_a_needed_frozen_component(pm, ladder):
+    """High importance with no movement is a re-arm, not a reinit."""
+    imp = {"m": torch.tensor([255], dtype=torch.uint8)}
+    pla = {"m": torch.tensor([0], dtype=torch.uint8)}
+
+    assert components.stale_mask(imp, pla, None) is None
+
+
+def test_stale_mask_skips_an_unmeasured_component():
+    """A median-filled placeholder can look dead and frozen at once."""
+    imp = {"m": torch.tensor([0, 0], dtype=torch.uint8)}
+    pla = {"m": torch.tensor([0, 0], dtype=torch.uint8)}
+    measured = {"m": torch.tensor([True, False])}
+
+    mask = components.stale_mask(imp, pla, measured)
+
+    assert mask["m"].tolist() == [True, False]
+
+
+def test_stale_mask_is_none_without_a_usable_readout():
+    two = {"m": torch.zeros(2)}
+    assert components.stale_mask(None, two, None) is None
+    assert components.stale_mask(two, None, None) is None
+    assert components.stale_mask(two, {"m": torch.zeros(3)}, None) is None
+
+
+def test_reinitialize_blanks_only_the_masked_component(pm, ladder):
+    """Redraw `aᵢ`, zero `bᵢ`, leave the rest of the adapter alone.
+
+    A zeroed row of `a` has no direction to recover from, so blanking both
+    factors would kill the component permanently.
+    """
+    _fake_slot(pm, ladder, [255, 0])
+    with torch.no_grad():
+        for _, mod in adapted_modules(pm):
+            mod.lora_A["s9"].weight.fill_(1.0)
+            mod.lora_B["s9"].weight.fill_(1.0)
+
+    mask = {n: torch.tensor([True, False]) for n, _ in adapted_modules(pm)}
+    saved = components.reinitialize(pm, "s9", mask)
+
+    assert saved
+    for _, mod in adapted_modules(pm):
+        b, a = mod.lora_B["s9"].weight, mod.lora_A["s9"].weight
+        assert torch.count_nonzero(a[0]) > 0
+        assert not torch.all(a[0] == 1.0)               # freshly drawn
+        assert torch.count_nonzero(b[:, 0]) == 0        # contributes nothing
+        assert torch.all(a[1] == 1.0)                   # kept components intact
+        assert torch.all(b[:, 1] == 1.0)
+
+
+def test_reinitialize_with_an_empty_mask_touches_nothing(pm, ladder):
+    _fake_slot(pm, ladder, [255, 0])
+    with torch.no_grad():
+        for _, mod in adapted_modules(pm):
+            mod.lora_A["s9"].weight.fill_(1.0)
+            mod.lora_B["s9"].weight.fill_(1.0)
+
+    mask = {n: torch.tensor([False, False]) for n, _ in adapted_modules(pm)}
+    components.reinitialize(pm, "s9", mask)
+
+    for _, mod in adapted_modules(pm):
+        assert torch.all(mod.lora_A["s9"].weight == 1.0)
+        assert torch.all(mod.lora_B["s9"].weight == 1.0)
+
+
+def test_restore_undoes_a_reinitialization(pm, ladder):
+    _fake_slot(pm, ladder, [255, 0])
+    a_before = {n: m.lora_A["s9"].weight.detach().clone() for n, m in adapted_modules(pm)}
+    b_before = {n: m.lora_B["s9"].weight.detach().clone() for n, m in adapted_modules(pm)}
+
+    mask = {n: torch.tensor([True, False]) for n, _ in adapted_modules(pm)}
+    saved = components.reinitialize(pm, "s9", mask)
+    components.restore(saved)
+
+    for n, mod in adapted_modules(pm):
+        assert torch.equal(mod.lora_A["s9"].weight, a_before[n])
+        assert torch.equal(mod.lora_B["s9"].weight, b_before[n])
+
+
+def test_effective_rank_is_measured_after_the_reinit(pm, ladder, buffer):
+    """A blanked component no longer spans its old direction.
+
+    The rank readout feeds `_rank_bound`'s handoff decision. Measured before the
+    reinit it describes a delta the slot no longer has, and it is persisted, so
+    the stale value outlives the sleep. Blanking every component leaves a zero
+    delta, so the correct reading is 0 — the same run without a reinit is the
+    control that it would otherwise have been positive.
+    """
+    wide = dict(reinit_importance=1.0, reinit_movement=1.0, reinit_loss_tol=1e9)
+    kept = run(pm, ladder, buffer, ladder.slots[2], _cfg()).eff_rank
+    rep = run(pm, ladder, buffer, ladder.slots[2],
+              _cfg(reinit=True, **wide))
+
+    assert kept > 0.0
+    assert rep.reinitialized == _components(pm, 2)
+    assert ladder.slots[2].effective_rank == 0.0
+    assert rep.eff_rank == ladder.slots[2].effective_rank
+
+
+def test_a_nan_check_loss_reverts_the_reinit(pm, ladder, buffer, monkeypatch):
+    """A tolerance wide enough to accept any finite rise still refuses NaN.
+
+    `after > start + tol` is False for NaN, so the broken slot would have been
+    committed and the non-finite loss reported as if the reinit had helped.
+    """
+    before = {}
+    flag = {"on": False}
+    real_fwd = pm.forward
+
+    def forward(*a, **kw):
+        out = real_fwd(*a, **kw)
+        if flag["on"] and out.loss is not None:
+            out.loss = out.loss * float("nan")
+        return out
+
+    pm.forward = forward
+    real = components.reinitialize
+
+    def blank_then_nan(pm_, adapter, mask):
+        before.update({n: m.lora_A["s2"].weight.detach().clone()
+                       for n, m in adapted_modules(pm_)})
+        out = real(pm_, adapter, mask)
+        flag["on"] = True            # the *next* forward is the check's
+        return out
+
+    monkeypatch.setattr(components, "reinitialize", blank_then_nan)
+    rep = run(pm, ladder, buffer, ladder.slots[2],
+              _cfg(reinit=True, reinit_importance=1.0, reinit_movement=1.0,
+                   reinit_loss_tol=1e9))
+
+    assert rep.reinit_reverted == _components(pm, 2) and rep.reinitialized == 0
+    for n, m in adapted_modules(pm):
+        assert torch.equal(m.lora_A["s2"].weight, before[n])
+
+
+def test_reinit_is_off_by_default():
+    assert SleepConfig(tokenizer=StubTokenizer()).reinit is False
+
+
+def test_reinit_lands_in_the_sleep_report(pm, ladder, buffer):
+    """Thresholds opened wide, so every component qualifies."""
+    rep = run(pm, ladder, buffer, ladder.slots[2],
+              _cfg(reinit=True, reinit_importance=1.0, reinit_movement=1.0,
+                   reinit_loss_tol=1e9))
+
+    assert rep.reinitialized == _components(pm, 2) and rep.reinit_reverted == 0
+    for key in ("reinitialized", "reinit_reverted", "comp_disp"):
+        assert key in rep.row()
+
+
+def test_reinit_off_leaves_the_slot_unblanked(pm, ladder, buffer):
+    rep = run(pm, ladder, buffer, ladder.slots[2],
+              _cfg(reinit_importance=1.0, reinit_movement=1.0))
+
+    assert rep.reinitialized == 0 and rep.reinit_reverted == 0
+
+
+def test_a_reinit_never_pairs_across_windows(pm, ladder, buffer, monkeypatch):
+    """The two halves must describe the same window.
+
+    A rank-1 slot's plasticity from sleep 1 is left in place; sleep 2 then
+    moves that component a lot. Before the fix the old "frozen" byte was paired
+    with the new importance and condemned a component the slot had just used.
+    """
+    run(pm, ladder, buffer, ladder.slots[0], _cfg())
+    assert ladder.slots[0].plasticity is not None
+    _zero(ladder.slots[0].plasticity)       # as if last window saw nothing move
+    seen = {}
+    real = components.stale_mask
+
+    def spy(imp, pla, *a):
+        seen["pla"] = None if pla is None else {n: t.clone() for n, t in pla.items()}
+        return real(imp, pla, *a)
+
+    monkeypatch.setattr(components, "stale_mask", spy)
+    run(pm, ladder, buffer, ladder.slots[0], _cfg(reinit=True))
+
+    assert seen["pla"] is not None      # this window measured its own
+
+
+def test_a_window_where_nothing_moved_still_records_plasticity(pm, ladder, buffer):
+    """At lr 0 the factors cannot move, so an all-zero readout is a measurement.
+
+    Storing `None` for it made a frozen window indistinguishable from an
+    unmeasured one, and `stale_mask` refuses a missing half — so the one window
+    where everything is stale by definition could never reinit.
+    """
+    rep = run(pm, ladder, buffer, ladder.slots[2],
+              _cfg(reinit=True, reinit_importance=1.0, reinit_loss_tol=1e9, lr=0.0))
+
+    assert ladder.slots[2].plasticity is not None
+    assert _peak(ladder.slots[2].plasticity) == 0
+    assert rep.comp_disp == 0.0 and rep.comp_moving == 0.0
+
+
+def test_a_reinit_only_run_has_a_fresh_importance(pm, ladder, buffer):
+    """With `components` off, a desired importance from an old window must not
+    stand in for a measurement this window never made."""
+    run(pm, ladder, buffer, ladder.slots[0], _cfg())
+    _zero(ladder.slots[0].importance)       # as if last window judged it dead
+
+    rep = run(pm, ladder, buffer, ladder.slots[0],
+              _cfg(components=False, reinit=True, reinit_importance=1.0,
+                   reinit_movement=1.0, reinit_loss_tol=1e9))
+
+    assert rep.reinitialized == _components(pm, 1)
+
+
+def test_a_reinit_that_would_cost_loss_is_reverted(pm, ladder, buffer, monkeypatch):
+    """No tolerance at all, so any rise on the check batch rolls it back."""
+    seen = {}
+    real = components.reinitialize
+
+    def record(pm_, adapter, mask):
+        seen["before"] = {n: p.detach().clone() for n, p in pm_.named_parameters()}
+        return real(pm_, adapter, mask)
+
+    monkeypatch.setattr(components, "reinitialize", record)
+    rep = run(pm, ladder, buffer, ladder.slots[2],
+              _cfg(reinit=True, reinit_importance=1.0, reinit_movement=1.0,
+                   reinit_loss_tol=-1e9))
+
+    assert seen["before"]
+    assert rep.reinit_reverted == _components(pm, 2) and rep.reinitialized == 0
+    for n, p in pm.named_parameters():
+        assert torch.equal(p.detach(), seen["before"][n])

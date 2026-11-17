@@ -36,11 +36,18 @@ class Slot:
     failures: int = 0
     effective_rank: float = 0.0
     last_gain: float = 0.0
-    # Per-component readouts, 8-bit. `importance` is measured by leave-one-out
-    # and decides what a merge may drop; `plasticity` is the share of the slot's
-    # own gradient each component still takes, and decides what may be refreshed.
-    importance: torch.Tensor | None = None
-    plasticity: torch.Tensor | None = None
+    # Per-component readouts, keyed by module and 8-bit: a component is a
+    # `(module, rank index)` pair, and rank 0 of one module has nothing to do
+    # with rank 0 of another. `importance` is measured by leave-one-out and
+    # decides what a merge may drop; `plasticity` is the relative factor
+    # displacement across the window, and decides what a reinit may overwrite.
+    # Neither is the gradient share — that is computed inline for rejuvenation.
+    importance: dict[str, torch.Tensor] | None = None
+    plasticity: dict[str, torch.Tensor] | None = None
+    # Which importance entries were probed rather than filled with a median.
+    # Persisted with `importance`, since without it a restart cannot tell a
+    # measurement from a placeholder and would prune on the fill again.
+    measured: dict[str, torch.Tensor] | None = None
 
 
 @dataclass
@@ -128,18 +135,23 @@ def save(pm, ladder: Ladder, out: Path) -> None:
     out.mkdir(parents=True, exist_ok=True)
     pm.save_pretrained(out)
     for slot in ladder.slots:
-        imp = slot.importance
-        if imp is not None:
-            f = out / slot.name / "adapter_model.safetensors"
-            sd = load_file(f)
-            sd["sleepy.importance"] = imp.detach().cpu().contiguous()
-            if slot.plasticity is not None:
-                sd["sleepy.plasticity"] = slot.plasticity.detach().cpu().contiguous()
-            save_file(sd, f)
         (out / slot.name / "sleepy.json").write_text(json.dumps(
             {"state": slot.state.value, "failures": slot.failures,
              "effective_rank": slot.effective_rank, "last_gain": slot.last_gain}),
             encoding="utf-8")
+        # Either readout alone is worth keeping — a reinit-only run fills the
+        # displacement half and never the importance one — so the adapter is
+        # rewritten if either is there, not only when importance is.
+        if slot.importance is None and slot.plasticity is None:
+            continue
+        f = out / slot.name / "adapter_model.safetensors"
+        sd = load_file(f)
+        for key, readout in (("importance", slot.importance),
+                             ("plasticity", slot.plasticity),
+                             ("measured", slot.measured)):
+            for module, t in (readout or {}).items():
+                sd[f"sleepy.{key}.{module}"] = t.detach().cpu().contiguous()
+        save_file(sd, f)
     ctrl = ladder.controller
     (out / _CONTROL / "sleepy.control.json").write_text(json.dumps(
         {"alpha_mult": ladder.alpha_mult, "sleep_depth": ladder.sleep_depth,
@@ -164,11 +176,19 @@ def load(pm, ladder: Ladder, src: Path) -> None:
             continue
         pm.load_adapter(str(d), adapter_name=slot.name)
         sd = load_file(d / "adapter_model.safetensors")
-        for key, attr in (("sleepy.importance", "importance"),
-                          ("sleepy.plasticity", "plasticity")):
-            t = sd.get(key)
-            if t is not None and t.numel() == slot.rank:
-                setattr(slot, attr, t.to(torch.uint8))
+        # Readouts are per module now, so a module missing from the file simply
+        # has no readout — a wrong width is skipped the same way it used to be,
+        # one module at a time.
+        for key, attr, dtype in (("importance", "importance", torch.uint8),
+                                 ("plasticity", "plasticity", torch.uint8),
+                                 ("measured", "measured", torch.bool)):
+            got = {}
+            for k, t in sd.items():
+                head = f"sleepy.{key}."
+                if k.startswith(head) and t.numel() == slot.rank:
+                    got[k[len(head):]] = t.to(dtype)
+            if got:
+                setattr(slot, attr, got)
         slot.state = SlotState.TRAINING      # loaded weights are as live as they get
         with suppress(OSError, ValueError, KeyError):
             meta = json.loads((d / "sleepy.json").read_text(encoding="utf-8"))
@@ -250,6 +270,7 @@ def release_slot(pm, ladder: Ladder, slot: Slot) -> None:
     # mistaken for a measurement of the next session's.
     slot.importance = None
     slot.plasticity = None
+    slot.measured = None
     refresh(pm, ladder)
 
 

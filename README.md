@@ -28,7 +28,10 @@ Design document plus a working reference implementation. The tests pin the
 invariants the design claims (exact no-op attach, atomic merge rollback, gated
 commits, bounded buffer); the demo exercises the loop end to end on a synthetic
 knowledge stream. Numbers from a 135M CPU run are meaningful in trend, not
-absolute value. Known gaps are listed in DESIGN.md §9.2.
+absolute value. Known gaps are listed in DESIGN.md §9.2. One subsystem there is
+prose only: conversational repetition detection (§6.8), which teaches that a
+similar-looking question does not have to get the same answer — designed, not
+built.
 
 ## Install
 
@@ -130,7 +133,7 @@ python -m sleepy.demo --model HuggingFaceTB/SmolLM2-135M --blocks on   # measure
 | `sleepy/merge.py` | tier 2 atomic merge with TIES truncation, and the tier-1 handoff |
 | `sleepy/blocks.py` | diffusion-block training and the matched-step A/B that gates it |
 | `sleepy/signals.py` | KL guard, trust region, effective rank, dormant-unit readout |
-| `sleepy/components.py` | per-component importance/plasticity readouts and the prune they feed |
+| `sleepy/components.py` | per-component importance/displacement readouts, the merge prune, and the reinit they gate |
 | `sleepy/controller.py` | six learned coefficients: per-component LR multiplier and trust gate |
 | `sleepy/optimizer.py` | selective Adam-moment rejuvenation, mask along the rank axis |
 | `sleepy/probe.py` | throwaway-copy plasticity exam |

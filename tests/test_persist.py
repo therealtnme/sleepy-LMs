@@ -17,6 +17,14 @@ from sleepy.ladder import SlotState, freeze_slot, load, open_slot, save
 from sleepy.signals import adapted_modules
 
 
+def _readout(pm, values, dtype=torch.uint8):
+    """A per-module readout: the same vector in every module, as the measurement
+    would give it. Rank index alone is not a component identity, so the key is
+    the module and the length is that module's rank."""
+    t = torch.tensor(values, dtype=dtype)
+    return {n: t.clone() for n, _ in adapted_modules(pm)}
+
+
 def _run(pm, ladder, workdir):
     from sleepy.sleep import SleepConfig, run
     from tests.conftest import StubTokenizer
@@ -78,8 +86,9 @@ def test_the_controller_survives(pm, ladder, buffer, workdir):
 def test_the_readouts_and_slot_state_survive(pm, ladder, buffer, workdir):
     _run(pm, ladder, buffer)
     slot = ladder.slots[2]
-    slot.importance = torch.tensor([255, 3], dtype=torch.uint8)
-    slot.plasticity = torch.tensor([9, 200], dtype=torch.uint8)
+    slot.importance = _readout(pm, [255, 3])
+    slot.plasticity = _readout(pm, [9, 200])
+    slot.measured = _readout(pm, [True, False], dtype=torch.bool)
     slot.effective_rank = 1.5
     slot.last_gain = 0.25
     freeze_slot(pm, ladder, slot)
@@ -95,12 +104,37 @@ def test_the_readouts_and_slot_state_survive(pm, ladder, buffer, workdir):
 
     got = fresh.slots[2]
     assert got.state is SlotState.FROZEN
-    assert got.importance.tolist() == [255, 3]
-    assert got.plasticity.tolist() == [9, 200]
+    assert sorted(got.importance) == sorted(n for n, _ in adapted_modules(pm))
+    for n, _ in adapted_modules(pm):
+        assert got.importance[n].tolist() == [255, 3]
+        assert got.plasticity[n].tolist() == [9, 200]
+        assert got.measured[n].tolist() == [True, False]
     assert got.effective_rank == 1.5 and got.last_gain == 0.25
     for n, m in adapted_modules(pm):
         if n in saved_b:
             assert torch.equal(m.lora_B["s2"].weight.detach(), saved_b[n])
+
+
+def test_a_plasticity_readout_alone_still_persists(pm, ladder, buffer, workdir):
+    """A reinit-only run fills displacement and never importance.
+
+    The save used to write the adapter only when importance was present, so the
+    half a reinit actually reads could be dropped while the other half was empty.
+    """
+    _run(pm, ladder, buffer)
+    slot = ladder.slots[2]
+    slot.importance = None
+    slot.plasticity = _readout(pm, [9, 200])
+    out = workdir / "adapter"
+    save(pm, ladder, out)
+
+    fresh = ladder.build(ladder.modules, (1, 1, 2))
+    open_slot(pm, fresh, fresh.slots[2])
+    load(pm, fresh, out)
+
+    assert fresh.slots[2].plasticity is not None
+    for n, _ in adapted_modules(pm):
+        assert fresh.slots[2].plasticity[n].tolist() == [9, 200]
 
 
 def test_the_depth_guess_survives(pm, ladder, buffer, workdir):
@@ -127,12 +161,20 @@ def test_a_missing_slot_dir_is_left_empty(pm, ladder, workdir):
 
 
 def test_a_wrong_width_readout_is_skipped_not_copied(pm, ladder, buffer, workdir):
+    """A wrong width is skipped one module at a time, and a shorter vector is
+    worse than a missing one — the module simply has no readout."""
     _run(pm, ladder, buffer)
+    slot = ladder.slots[2]
+    slot.importance = _readout(pm, [255, 3])
+    slot.measured = _readout(pm, [True, False], dtype=torch.bool)
     out = workdir / "adapter"
     save(pm, ladder, out)
     f = out / "s2" / "adapter_model.safetensors"
+
+    bad = next(n for n, _ in adapted_modules(pm))
     sd = load_file(f)
-    sd["sleepy.importance"] = torch.tensor([1, 2, 3], dtype=torch.uint8)   # rank 2
+    sd[f"sleepy.importance.{bad}"] = torch.tensor([1, 2, 3], dtype=torch.uint8)  # rank 3
+    del sd[f"sleepy.measured.{bad}"]       # absent, so nothing marks it measured
     from safetensors.torch import save_file
     save_file(sd, f)
 
@@ -140,4 +182,11 @@ def test_a_wrong_width_readout_is_skipped_not_copied(pm, ladder, buffer, workdir
     fresh.slots[2].importance = None
     load(pm, fresh, out)
 
-    assert fresh.slots[2].importance is None
+    got = fresh.slots[2].importance
+    assert got is not None
+    assert bad not in got
+    good = next(n for n, _ in adapted_modules(pm) if n != bad)
+    assert got[good].tolist() == [255, 3]
+    # The skip is per module: the good module's provenance survives, so a later
+    # prune still knows its score is a measurement rather than the median fill.
+    assert fresh.slots[2].measured[good].tolist() == [True, False]

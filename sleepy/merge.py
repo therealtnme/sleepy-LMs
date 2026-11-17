@@ -68,25 +68,40 @@ def ties_truncate(delta: torch.Tensor, conflict: float) -> torch.Tensor:
 
 
 def _component_mask(slot: Slot | None, cfg: MergeConfig,
-                    floor: float, rank: int) -> torch.Tensor | None:
-    """Per-component 1/0 over `rank`, or None when no readout applies.
+                    floor: float, name: str, rank: int) -> torch.Tensor | None:
+    """Per-component 1/0 for module `name` over `rank`, or None when nothing applies.
 
     Two independent prunes, both from the measured importance: the `floor`
     strips a component that never scored, and `component_drop_fraction` drops
     the lowest-scored share. They are prunes of the *rank*, not of the element
     magnitudes, so the TIES truncation still runs on what survives.
+
+    Both only act on components that were actually probed. Unprobed ones hold a
+    median fill rather than a score, and the floor's `0.0` default would make a
+    relative ordering decision out of that placeholder: a fill below zero never
+    happens, but a fill near the top of the scale would strip 56 of 64
+    components at the default probe cap. An unmeasured component is exempted
+    from the prune instead — preserving a component whose importance is unknown
+    is the cheaper error.
     """
     if slot is None or slot.importance is None:
         return None
-    if slot.importance.numel() != rank:
+    imp = slot.importance.get(name)
+    if imp is None or imp.numel() != rank:
         return None
-    mask = components.keep_mask(slot.importance, cfg.component_drop_fraction)
+    keep = None
+    if cfg.component_drop_fraction > 0:
+        keep = components.keep_mask(imp, cfg.component_drop_fraction)
     if floor > 0:
-        measured = (slot.importance > components.MAX * floor).float()
-        mask = measured if mask is None else mask * measured
-    if mask is not None and not bool(mask.any()):
+        scored = (imp > components.MAX * floor).float()
+        keep = scored if keep is None else keep * scored
+    measured = None if slot.measured is None else slot.measured.get(name)
+    if measured is not None and measured.numel() == rank:
+        keep = torch.ones(rank) if keep is None else keep
+        keep = torch.where(measured.bool(), keep, torch.ones_like(keep))
+    if keep is not None and not bool(keep.any()):
         return None                           # nothing measured: keep the rank
-    return mask
+    return keep
 
 
 def compute_deltas(pm, adapter: str, cfg: MergeConfig,
@@ -110,7 +125,7 @@ def compute_deltas(pm, adapter: str, cfg: MergeConfig,
         # `dW = sum_i b_i a_i^T`, so the rank axis is summed out and a component
         # is dropped by zeroing its b row before the product, not by indexing the
         # result (which is d_out x d_in, not rank columns).
-        mask = _component_mask(slot, cfg, floor, b.shape[1])
+        mask = _component_mask(slot, cfg, floor, name, b.shape[1])
         d = (b * mask[None, :]) @ a if mask is not None else b @ a
         out[name] = cfg.delta_scale * ties_truncate(d, cfg.sign_conflict) \
             * mod.scaling[adapter]

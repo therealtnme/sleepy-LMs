@@ -82,7 +82,8 @@ Append-only JSONL of `(session_id, turn, role, text, ts, tags, source)`.
   becomes "fact" without ever having been checked — mark it.
 * **Reservoir sampling** on eviction keeps a uniform sample of the long tail;
   recency weighting lives in the sampler, not in the store, so the store stays
-  replayable in different mixes.
+  replayable in different mixes. The draw is per exchange: a prompt and its
+  answer are admitted or evicted together, never one without the other.
 * Tier 0 is the only tier a user can inspect and delete. Deleting an item does
   not unlearn it from tier 1/2 — that is a separate (harder) problem, see §9.
 
@@ -960,7 +961,39 @@ Resolved, with the evidence that closed each one:
   reservoir the live path uses, and skips core keys — the on-disk double write
   (first append, then core append) makes that skip necessary.
 * **`_reserve` and `_load` draw once per exchange, not once per item.** An
-  exchange is admitted or dropped whole, pick had already consumed. They now come
+  exchange is admitted or dropped whole, and `add_turns` flushes an exchange as
+  one group so its own write cannot split it. The draw happens even when the
+  group joins a full pool (else it could never be kept), and one draw frees one
+  record: a group victim takes its whole exchange, a lone one takes only itself,
+  so the group is admitted only as far as the room that removal freed. Appending
+  a two-turn exchange against a lone victim otherwise took a whole group in each
+  time and the pool reached twice capacity — more on every reload. The draw
+  index is clamped once and the clamped index is what gets removed, since a
+  pool left short by an earlier group removal can be shorter than the index.
+  Keys the pool already holds are dropped before the draw, because eviction
+  removes by exchange now rather than overwriting a slot, and a resumed session
+  re-sending its turns would otherwise train them twice. `_load` replays every
+  write — superseded copies included, each under its own banked `seen` index,
+  the index the live path drew against — so the draw denominator and the
+  selection reproduce rather than drawing against the new tail; replaying the
+  copy is also what retires it, through the same key drop the live path runs.
+  An epoch restarts on any index jump, and a continued exchange id repeats a
+  turn key it already holds when a resumed session re-sends itself, which marks
+  the copy as a new group instead of fusing the pair into a four-member one.
+  A promoted row replays too: its admitted copy carries `is_core=False` and
+  reserves under its own index, its later core copy is passed over, and the
+  core write pulls its key back out of the pool exactly as `bank_core` did —
+  so promotion of a live pool member, which `orchestrator._promote_replayed`
+  does after every sleep, leaves the partner half in the pool and the reload
+  selection unchanged.
+* **An oversized body is kept unfit instead of not admitted.** An exchange wider
+  than capacity used to be dropped from the pool outright even though its turns
+  were already on disk, so it never replayed — and a lone oversize `add` had
+  always left its head in the pool, so the two disagreed. `_reserve` now takes
+  the head and marks it `unfit`; `_load` carries the head back the same way and
+  never re-inflates to the logged tail. `unfit` stays off the log.
+* **`select()` could put one item in a batch twice**: random diversifiers were
+  drawn from the pool the importance pick had already consumed. They now come
   from the remainder, and `select()` takes the scored candidate list instead of
   re-deriving buffer order and silently discarding the scores.
 * The test tokenizer was non-deterministic, so a loss measured before a step was

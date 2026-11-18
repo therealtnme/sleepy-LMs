@@ -65,6 +65,12 @@ class Ladder:
     # until a sleep has measured one. Rate memory, not model memory: it describes
     # how converged this model is on this experience, so it belongs with the ladder.
     sleep_depth: int | None = None
+    # Repetition pair -> count of consecutive sleeps that flagged it. One flag
+    # is a candidate, and the contrastive term is only paid once the same pair
+    # has survived `repetition_loss_steps` sleeps, so the streak belongs to the
+    # ladder rather than to one run. Pairs not re-flagged are dropped instead of
+    # aged: a pair that stops looking stale should stop being paid at once.
+    repetition_streaks: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def build(cls, modules: list[str], ranks: tuple[int, ...] = RANKS,
@@ -155,6 +161,7 @@ def save(pm, ladder: Ladder, out: Path) -> None:
     ctrl = ladder.controller
     (out / _CONTROL / "sleepy.control.json").write_text(json.dumps(
         {"alpha_mult": ladder.alpha_mult, "sleep_depth": ladder.sleep_depth,
+         "repetition_streaks": ladder.repetition_streaks,
          "controller": None if ctrl is None else {
              "lr": list(ctrl.lr), "trust": list(ctrl.trust),
              "eta": ctrl.eta, "decay": ctrl.decay, "scale": ctrl.scale}},
@@ -168,6 +175,12 @@ def load(pm, ladder: Ladder, src: Path) -> None:
     resized: the file was written by some other code, and a wrong-width vector
     against a slot is worse than a missing one. A slot directory missing
     entirely is left as the freshly attached no-op.
+
+    Pass the wrapper `attach` returned, not the bare model. `load` refills
+    slots that `attach` has already created under the same names, and a name is
+    only a duplicate to the `peft_config` of a PeftModel: on the bare model,
+    `load_adapter` injects a second set of `lora_A`/`lora_B` under names that
+    already exist, while through the wrapper it writes into the ones there.
     """
     src = Path(src)
     for slot in ladder.slots:
@@ -202,6 +215,8 @@ def load(pm, ladder: Ladder, src: Path) -> None:
         ladder.alpha_mult = float(meta["alpha_mult"])
         dep = meta.get("sleep_depth")
         ladder.sleep_depth = None if dep is None else int(dep)
+        ladder.repetition_streaks = {str(k): int(v) for k, v in
+                                     (meta.get("repetition_streaks") or {}).items()}
         c = meta.get("controller")
         if c:
             # The controller module imports nothing from here, so this is acyclic.

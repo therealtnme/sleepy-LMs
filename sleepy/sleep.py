@@ -14,9 +14,9 @@ from pathlib import Path
 
 import torch
 
-from . import assoc, components, controller, optimizer, signals
+from . import assoc, components, controller, optimizer, repetition, signals
 from .buffer import Buffer, Item, render
-from .ladder import Ladder, Slot, freeze_slot, open_slot, quarantine_slot
+from .ladder import Ladder, Slot, freeze_slot, open_slot, quarantine_slot, refresh
 
 
 @dataclass
@@ -111,6 +111,23 @@ class SleepConfig:
     assoc_k: int = 2                 # neighbours looked up per selected item
     assoc_min: float = 0.30          # cosine floor a neighbour must clear
     assoc_share: float = 0.5         # added items as a share of the batch
+    # Conversational repetition detection: flag an answer carried over from the
+    # previous exchange into a request that asks for something else, and pay a
+    # contrastive term that pushes the correction above the stale text. Off by
+    # default — the three scores are uncalibrated until an evaluation over
+    # labelled pairs exists, so it should collect flags before it is trusted to
+    # move weights. `repetition_loss_steps` is the streak a pair must reach
+    # first: one flag is a candidate, and one sleep is one flag.
+    repetition_guard: bool = False
+    repetition_response_threshold: float = 0.85   # `similar` floor a pair must clear
+    repetition_max_pairs: int = 8    # pairs considered per sleep; each costs generations
+    repetition_loss_steps: int = 2   # consecutive flagged sleeps before the term is paid
+    repetition_loss_weight: float = 0.02
+    repetition_beta: float = 1.0     # logistic temperature on the likelihood margin
+    # Ask the frozen teacher for a correction when the buffer has none. Worth
+    # knowing on a live model and worth avoiding in a test, where it is one
+    # generation per flag.
+    repetition_teacher: bool = False
 
 
 @dataclass
@@ -154,6 +171,14 @@ class SleepReport:
     depth: float = float("nan")
     # Items added to the batch by associative expansion (0 when off).
     assoc: int = 0
+    # Repetition flags seen this sleep, how many cleared the streak and were
+    # paid, and how many of those had a correction at all. The last is the
+    # number that matters for `require_correction`: a flag with nothing to
+    # prefer teaches nothing, so it is counted apart rather than paid.
+    repetition_flags: int = 0
+    repetition_paid: int = 0
+    repetition_uncorrected: int = 0
+    repetition_loss: float = float("nan")
     gate_ok: bool = False
     reason: str = ""
 
@@ -161,7 +186,8 @@ class SleepReport:
             "kl_commit", "core_loss", "delta_ratio", "eff_rank", "comp_live",
             "comp_moving", "comp_disp", "rejuvenated", "reinitialized",
             "reinit_reverted", "adapt_mult", "adapt_gate",
-            "adapt_steps", "depth", "assoc", "gate_ok", "reason")
+            "adapt_steps", "depth", "assoc", "repetition_flags",
+            "repetition_paid", "repetition_uncorrected", "gate_ok", "reason")
 
     def row(self) -> dict:
         return {k: getattr(self, k) for k in self.KEYS}
@@ -174,6 +200,114 @@ def encode(cfg: SleepConfig, text: str) -> dict:
     labels[tok["attention_mask"] == 0] = -100
     return {"input_ids": tok["input_ids"], "attention_mask": tok["attention_mask"],
             "labels": labels}
+
+
+def answer_logprob(pm, ladder: Ladder, prompt: str, answer: str, cfg: SleepConfig,
+                   slot: Slot) -> torch.Tensor | None:
+    """Mean per-token log-likelihood of `answer` given `prompt`, gradient attached.
+
+    Teacher-forced, one forward: the prompt is context, only the answer's
+    tokens are scored, and the prompt's own tokens are masked out of the label
+    the same way a pad token is. Per-token mean rather than a sum, so a short
+    stale answer does not beat a long correction by being short.
+
+    Refused slots are switched off for the forward, as everywhere else: the
+    delta under judgement is this sleep's alone, and a frozen slot's opinion
+    would make the margin a comparison of the past against itself. The slot is
+    activated as the only adapter so gradients reach it; `refresh` puts the
+    ladder-wide set back in a `finally`, because a raise here must not leave
+    the next step training against a single-slot mask.
+    """
+    # Where the answer starts is the prompt's own length, which the padded
+    # batch cannot tell us: `encode` pads on the *right*, so the unmasked span
+    # is prompt-plus-answer, not the answer. Encoding the prompt alone gives the
+    # boundary, and truncation by `seq_len` falls out of it — a prompt that
+    # already fills the window leaves nothing to score.
+    start = int(encode(cfg, prompt.rstrip())["attention_mask"][0].sum())
+    batch = encode(cfg, prompt.rstrip() + "\n" + answer.strip())
+    batch.pop("labels")
+    was_training = pm.training
+    try:
+        pm.eval()
+        # The tuner's own wrapper takes a bare name and would reject the list;
+        # the model-level one accepts either, and only a list keeps the rest of
+        # the ladder out of the forward without a second call.
+        pm.base_model.set_adapter([slot.name])
+        logits = pm(**batch).logits
+    finally:
+        pm.train(was_training)
+        refresh(pm, ladder)
+    mask = batch["attention_mask"]
+    # `logits[:, t]` predicts `ids[:, t+1]`, so the two are shifted into
+    # register and the prompt's last position is dropped with its tokens.
+    want = batch["input_ids"][:, start:]
+    keep = mask[:, start:].bool()
+    if not bool(keep.any()):
+        return None            # the answer did not fit in `seq_len`
+    picked = logits[:, start - 1:-1].gather(-1, want.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+    return picked[keep].mean()
+
+
+def contrast(pm, ladder: Ladder, slot: Slot, repeats,
+             cfg: SleepConfig) -> torch.Tensor | None:
+    """The preference term: `-log sigmoid(beta * (logp(correction) - logp(stale)))`.
+
+    A pairwise ranking rather than a target likelihood, so the model is not told
+    *what* to say, only that the correction must be likelier than the answer it
+    copied. Averaged over the paid pairs, and `None` when no pair produced a
+    usable forward, so a truncated pair cannot silently contribute a zero.
+    """
+    terms = []
+    for cand, corr in repeats:
+        if not corr.request:
+            continue
+        good = answer_logprob(pm, ladder, corr.request, corr.text, cfg, slot)
+        bad = answer_logprob(pm, ladder, corr.request, cand.now.text, cfg, slot)
+        if good is None or bad is None:
+            continue
+        terms.append(torch.nn.functional.softplus(-cfg.repetition_beta * (good - bad)))
+    return torch.stack(terms).mean() if terms else None
+
+
+def generate(pm, prompt: str, cfg: SleepConfig) -> str:
+    """Greedy continuation of `prompt`, on the live model.
+
+    Greedy rather than sampled: the comparison is of weights, and a sampled
+    second answer would differ from the first for reasons that have nothing to
+    do with this sleep. `render` writes the turn markers, so the model sees the
+    prompt the way it was trained to, and the chat template is left alone —
+    `render` is the same flattening training used. `decode` may be absent on a
+    tokenizer stub, which leaves an empty answer rather than killing the sleep.
+    """
+    was_training = pm.training
+    try:
+        pm.eval()
+        batch = encode(cfg, render([Item(session=-1, turn=0, role="user",
+                                         text=prompt, source="user")]))
+        batch.pop("labels")
+        with torch.no_grad(), pm.disable_adapter():
+            got = pm.generate(**batch, max_new_tokens=cfg.seq_len,
+                              do_sample=False,
+                              pad_token_id=getattr(cfg.tokenizer, "pad_token_id", 0) or 0)
+    finally:
+        pm.train(was_training)
+    decode = getattr(cfg.tokenizer, "decode", None)
+    if decode is None:
+        return ""
+    return decode(got[0][batch["input_ids"].shape[1]:],
+                  skip_special_tokens=True).strip()
+
+
+def teacher_for(pm, cfg: SleepConfig):
+    """A correction source backed by the live model with every adapter masked.
+
+    Bound once per sleep rather than per candidate, and only when asked for:
+    each call is a full generation, so an unasked-for teacher is a sleep's
+    worth of latency for nothing.
+    """
+    if not cfg.repetition_teacher:
+        return None
+    return lambda request: generate(pm, request, cfg)
 
 
 def batches_of(cfg: SleepConfig, items: list[Item]) -> list[dict]:
@@ -332,6 +466,20 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
     # Every selected item lands exactly once: `expand` is additive and draws
     # from `pool`, which is disjoint from `items`.
 
+    # Repetition detection, then corrections. Neither touches the replay batch
+    # — the correction's own tokens are never among `items` — so this only adds
+    # gradient through the contrastive term below.
+    repeats: list[tuple[repetition.Candidate, repetition.Correction]] = []
+    flags = paid = uncorrected = 0
+    if cfg.repetition_guard:
+        ladder.repetition_streaks, repeats, flags = repetition._exchanges(
+            buffer.all(), cfg.repetition_response_threshold,
+            ladder.repetition_streaks, cfg.repetition_loss_steps,
+            teacher_for(pm, cfg), cfg.repetition_max_pairs)
+        uncorrected = sum(1 for _, corr in repeats if corr.text is None)
+        repeats = [(cand, corr) for cand, corr in repeats if corr.text is not None]
+        paid = len(repeats)
+
     # Readout accumulators, keyed by module: a component is (module, rank index),
     # and a fresh slot's factors only exist per module.
     energy: dict[str, components.Readout] = {"grad": {}, "disp": {}}
@@ -395,12 +543,22 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
     # used only as the fallback.
     seen: dict[int, float] = {}
     prev_loss = None
+    rep_losses: list[float] = []
     pm.train()
     while step < cfg.budget_steps:
         batch = batches[cursor % len(batches)]
         cursor += 1
         batch_loss = 0.0
-        for _ in range(n_passes):
+        # Inside the step, so the delta the gate judges carries the preference
+        # with it; but once per step, not per pass — the term does not depend on
+        # the batch and one payment per pass would only multiply its cost. It is
+        # scaled by `n_passes` where it is added so the loop's 1/N keeps the
+        # configured weight rather than dividing it away.
+        rep_term = (contrast(pm, ladder, slot, repeats, cfg)
+                    if repeats else None)
+        if rep_term is not None:
+            rep_losses.append(float(rep_term.detach()))
+        for pass_i in range(n_passes):
             if span is None:
                 out = pm(**batch)
                 logits, lm_loss = out.logits, out.loss
@@ -420,6 +578,8 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
                     tlog = teacher(input_ids=batch["input_ids"],
                                    attention_mask=batch["attention_mask"]).logits
                 loss = loss + beta * signals.kl_guard(logits, tlog)
+            if rep_term is not None and pass_i == 0:
+                loss = loss + cfg.repetition_loss_weight * n_passes * rep_term
             (loss / n_passes).backward()
             batch_loss += float(lm_loss.detach())
         # Converged yet? Judge this step's loss against the same batch's loss at
@@ -595,7 +755,11 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
         adapt_mult=mult_sum / adapt_steps if adapt_steps else float("nan"),
         adapt_gate=gate_sum / adapt_steps if adapt_steps else float("nan"),
         adapt_steps=adapt_steps,
-        depth=depth_sum / step if step else float("nan"), assoc=assoc_added)
+        depth=depth_sum / step if step else float("nan"), assoc=assoc_added,
+        repetition_flags=flags, repetition_paid=paid,
+        repetition_uncorrected=uncorrected,
+        repetition_loss=(sum(rep_losses) / len(rep_losses)
+                         if rep_losses else float("nan")))
 
 
 def commit(pm, ladder: Ladder, slot: Slot, rep: SleepReport, cfg: SleepConfig,

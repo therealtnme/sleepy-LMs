@@ -20,14 +20,24 @@ class StubTokenizer:
 
     Random ids per call make a loss measured before a step incomparable to one
     measured after it, which drowns small deltas in tokenizer noise.
+
+    The id sequence depends on the whole string, the length on the `max_length`
+    it is given — so encoding a prefix and encoding prefix-plus-answer differ by
+    the answer's tokens (one per character, whitespace included) and the two
+    share a prefix. Without that, `answer_logprob` cannot find where the answer
+    starts: it derives the boundary from the prompt's own length, and a token
+    per character that always padded to `max_length` would report the window,
+    not the prompt. An answer past the window is cut at the window, the way a
+    truncating tokenizer would.
     """
 
     eos_token_id = 0
 
     def __call__(self, text, **kw):
+        width = min(len(text.rstrip()) or 1, kw.get("max_length", 16))
         seed = int.from_bytes(hashlib.blake2b(text.encode(), digest_size=8).digest(), "big")
         gen = torch.Generator().manual_seed(seed)
-        ids = torch.randint(1, 256, (1, kw.get("max_length", 16)), generator=gen)
+        ids = torch.randint(1, 256, (1, width), generator=gen)
         return {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
 
 

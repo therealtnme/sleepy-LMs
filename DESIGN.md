@@ -553,7 +553,9 @@ turns a three-pass sleep into a plain fine-tune.
 The reservoir keeps the long tail but scatters it (§7): two facts about the same
 town are as likely to be replayed in different sleeps as together, so each is
 trained in a batch with nothing else about the town and the slot fits two
-singletons instead of the relation between them.
+singletons instead of the relation between them. The exchange grouping (§3, §6.8)
+narrows the scatter only inside one exchange; facts from different exchanges on
+one subject still land in different draws.
 
 Association is a lexical proxy for that relation. The pool — the items the
 sampler already passed over — is indexed by hashed word unigrams and bigrams,
@@ -612,7 +614,7 @@ valid. What it cannot restore is process state outside the ladder: the block
 verdict (§9.2), the buffer's in-memory pool, and any optimizer moments. A
 restart still re-asks the block A/B and reloads the log from tier 0.
 
-### 6.8 `[Δ]` Conversational repetition detection — proposed, not implemented
+### 6.8 `[Δ]` Conversational repetition detection
 
 A model trained for a long time on one pattern learns the cheap rule "a prompt
 about X gets the answer about X" and stops reading *what is being asked*. The
@@ -648,7 +650,8 @@ against the *previous* exchange:
 * `Gₐ` — answer-relevance gap: does the current response address *this* prompt's
   intent, or only its topic.
 
-Risk `R = (1 − E) · Sᵣ · Dᵢ · Gₐ`, all in `[0, 1]`, where `E` is the confidence
+Risk `R = (1 − E) · Sᵣ · Dᵢ · Gₐ`, all in `[0, 1]` — a sketch score; as
+implemented `R` is reported, not thresholded (see the end of this section) — where `E` is the confidence
 that repetition was **asked for** — an exact repeat ("word for word"), a recall
 ("what did you say earlier") or a transform ("say that more simply") should not
 be penalized, and a negative instruction ("don't repeat yourself") should raise
@@ -664,8 +667,8 @@ stale answer only teaches the model not to repeat, not what to say instead, so a
 pair from stage 1 is *recorded* and only becomes a training pair once a
 correction exists. Sources in descending trust: an explicit user correction; a
 verified historical response that does match the new request; a frozen-teacher
-response, accepted only after a relevance check (the same `Gₐ` on the teacher's
-text). With no correction the candidate is metadata, never a penalty.
+response, tried last and only when the buffer's own history yielded nothing.
+With no correction the candidate is metadata, never a penalty.
 
 **Preference, not a second loss over the same string.** The training signal is
 pairwise:
@@ -677,14 +680,31 @@ over the same new prompt `x`. Both sides are scored, so the working direction is
 The adapter's own `log P` is the reference, so this needs no second model at
 inference; `y_old` is only available from tier 0.
 
-**What tier 0 is missing.** `Item` is a single message and the reservoir evicts
-messages, not exchanges (DESIGN §3, §7) — two turns of one exchange can be
-evicted independently, and `select()` (§7) can draw half an exchange. A pair
-detector therefore cannot be built on `Item` as it stands. Needed: an exchange
-identifier on `Item`, and exchange-granular sampling and eviction for anything
-the repetition path replays. `role` is a free string today, so a session that
-does not alternate user/assistant is silently unpairable — the pairing has to be
-by exchange id, not by "the next item".
+**What tier 0 was missing, and what it got.** `Item` is a single message and the
+reservoir evicted messages, not exchanges (DESIGN §3, §7) — two turns of one
+exchange could be evicted independently, and an answer could survive the prompt
+it answers with nothing left to say what it was for. `add_turns` now stamps an
+`exchange` id on every turn of a prompt and flushes each prompt as one group; a
+single draw admits or evicts the whole exchange. A body wider than capacity,
+which no draw can make fit, is kept unfit: its head goes in the pool, the log
+keeps the rest, and a reload knows not to re-inflate it. `select()` (§7) is
+still message-granular; the
+detector reads exchanges whole, so a half-drawn batch costs it a pair, not a
+wrong pairing.
+
+The detector does not pair on the id — it could not, since a response written by
+a live session is not in tier 0 yet when it is scored. `exchange_of` takes the
+run of `user` items directly above an answer, which is the shape
+`buffer.render` writes, and `pairs` walks that and stops at the first item that
+is not a user turn rather than guessing. The id is what lets an eviction keep
+both halves together; pairing still comes from order, and an answer with no
+request above it yields no pair instead of a wrong one. The correction's own
+tokens are deliberately not part of `items` — the term is the whole of its
+gradient contribution.
+
+The id is not in `key()`, so the log's identity is unchanged and an old row
+loads with an empty exchange. Such a row is still replayable and still pairable
+by order; it just carries no exchange label.
 
 **Cost and shape.** All of it is sleep-time. `L` is one extra term on the sleep's
 own optimizer, weighted small (`~0.02`) so the replay loss keeps dominating —
@@ -695,6 +715,51 @@ other: the commit gate sees it and a refusal rolls it back with the rest. Staged
 detection and reporting first (`repetition_guard` off), then correction quality,
 then the `L` term. Default off until detection is shown to flag real failures on
 real transcripts.
+
+**As implemented (`repetition.py`).** All three stages exist and
+`repetition_guard` turns them on together; the staging above is the rollout
+order, not a set of switches. What shipped differs from the sketch in three
+ways, each because the sketch's shape did not hold against the tests:
+
+* The scores are lexical only. `similar` is a normalized longest-run fraction
+  over content words, `gap` compares normalized requests by subject and
+  polarity and returns 1.0 on a negation flip, `affirm` comes from
+  `repeat_intent` — only a verbatim ask forgives everything, a soft "again"
+  forgives half, and a transform or recall forgives nothing because both want
+  the content *re-presented*. There is no semantic comparison; `Gₐ` collapsed
+  into `gap`'s subject term plus the correction sources, since an answer that
+  does not address the request shows up as no source fitting it. The similarity
+  floors are still guesses — the default stays off for that reason.
+* `risk` is *not* the gate. The verbatim copy this subsystem exists for scores
+  `gap` 0.8, and so does an asked-for repeat, so no product cutoff separates
+  them. `pairs` therefore only measures (`similar >= threshold`), and `flagged`
+  applies two structural vetoes instead: `affirm < 1.0` and a re-ask of the same
+  words to an unchanged model. `risk` is reported and never compared.
+* Correction is by descending trust over the buffer — the user's follow-up, an
+  answer whose own request was about this subject, a stock answer that shares a
+  content word with the fresh one — and only then the teacher. A flag with no
+  correction is counted in `repetition_uncorrected` and skipped, since without
+  a `y_correct` there is no margin to compute.
+
+The `L` term is paid at most once per step, scaled by `n_passes` so the pass
+loop's 1/N does not divide it away, and it enters before the gate so a refusal
+rolls it back with the rest. Both sides of the margin are scored with the
+ladder's other slots switched off, so it compares this sleep's delta against
+itself rather than against the frozen past. Per-token means, so a short stale
+answer cannot win by being short.
+
+Streaks live on `Ladder.repetition_streaks` and are persisted beside
+`sleep_depth` (§6.7): one flag is a candidate, and `repetition_loss_steps`
+consecutive flags are what buys a payment, so the state has to outlive the
+sleep that saw the first one. A pair not re-flagged is dropped rather than
+aged — a pair that stops looking stale should stop being paid at once.
+
+Two costs worth knowing. The answer boundary is the prompt's own encoded
+length, so both halves of a pair have to fit in `seq_len` or the term silently
+goes missing (`repetition_loss` comes back NaN and `repetition_paid` is still
+counted); a live `seq_len` is far above the ~80 tokens a pair needs. And the
+teacher is one generation per uncorrected flag, which is why it is off by
+default even when the guard is on.
 
 ## 7. Replay mix
 
@@ -875,10 +940,9 @@ Resolved, with the evidence that closed each one:
   interleave or vanish and a torn tail line is skipped on load. Two `Buffer`
   objects over one path still hold independent in-memory pools, so each process's
   view is stale relative to the other's writes until it reloads.
-* **§6.8 is prose.** No `repetition.py` exists, so nothing detects response
-  reuse, and the exchange id it needs is not on `Item`. The proposal also
-  assumes the response is *in* tier 0: a deployment that logs only user turns
-  has no `y_old` to compare against.
+* **A deployment that logs only user turns cannot feed §6.8.** The detector needs
+  `y_old`, the response actually given, and that only exists in tier 0. Nothing
+  validates the caller's log shape against that.
 * **Only the merge residual is exception-safe, not the process.** The mutate →
   gate window now rolls back in-memory state, but nothing is written to disk: a
   kill -9 between the base write and the gate still loses the commit, because the
@@ -895,8 +959,8 @@ Resolved, with the evidence that closed each one:
   past capacity and re-added promoted core items to it. It now reruns the same
   reservoir the live path uses, and skips core keys — the on-disk double write
   (first append, then core append) makes that skip necessary.
-* **`select()` could put one item in a batch twice**: random diversifiers were
-  drawn from the pool the importance pick had already consumed. They now come
+* **`_reserve` and `_load` draw once per exchange, not once per item.** An
+  exchange is admitted or dropped whole, pick had already consumed. They now come
   from the remainder, and `select()` takes the scored candidate list instead of
   re-deriving buffer order and silently discarding the scores.
 * The test tokenizer was non-deterministic, so a loss measured before a step was

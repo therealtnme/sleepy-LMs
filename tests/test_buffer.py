@@ -287,12 +287,28 @@ def test_a_mixed_write_pattern_never_overshoots_capacity(tmp_path):
             assert _torn(b.all(), path) == {}, (cap, seed)
 
 
-def test_a_turn_ahead_of_any_prompt_stands_alone(tmp_path):
-    b = Buffer(tmp_path / "e.jsonl", capacity=4, seed=0)
+def test_a_turn_ahead_of_any_prompt_is_its_own_group(tmp_path):
+    """A leading run has no owner but flushes as one group, so it needs an id:
+    an empty one is eviction's "standalone" marker and the reload would split
+    the run into singletons, drawing a different victim than the live path."""
+    path = tmp_path / "e.jsonl"
+    b = Buffer(path, capacity=4, seed=0)
     b.add_turns(1, [("system", "s", "system"), ("user", "q", "user"),
                     ("assistant", "a", "model")])
     got = [(it.text, it.exchange) for it in b.all()]
-    assert got == [("s", ""), ("q", "1.1"), ("a", "1.1")]
+    assert got == [("s", "1.lead"), ("q", "1.1"), ("a", "1.1")]
+
+
+def test_a_leading_run_draws_the_same_on_reload(tmp_path):
+    """The run is wider than the room at capacity 1, so live keeps its head and
+    marks it unfit; a replay that split the run would keep the tail instead."""
+    path = tmp_path / "e.jsonl"
+    b = Buffer(path, capacity=1, seed=0)
+    b.add_turns(1, [("assistant", "a1", "model"), ("assistant", "a2", "model")])
+    assert [it.text for it in b.all()] == ["a1"]
+    reloaded = Buffer(path, capacity=1, seed=0)
+    assert [it.text for it in reloaded.all()] == ["a1"]
+    assert [it.key() for it in reloaded.all()] == [it.key() for it in b.all()]
 
 
 def test_sample_excludes_by_key(tmp_path):

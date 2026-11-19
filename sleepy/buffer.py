@@ -324,7 +324,14 @@ class Buffer:
         having to pass one. Each exchange is reserved as one group, so its
         halves cannot be separated by eviction.
 
-        Turns ahead of the first `user` have no owner and stand alone.
+        Turns ahead of the first `user` have no owner but still flush as one
+        group, so they get an id of their own rather than an empty one: an
+        empty `exchange` says "standalone" to eviction, and `_load` splits a
+        run of them into singletons, which would make a leading run draw
+        differently on replay than it did live. The id carries a `lead` marker
+        so a turn index cannot forge it — a resumed session sends its `user`
+        turn at index 0, which would otherwise collide with the leading run's
+        id and read back as the same exchange.
         """
         exchange = ""
         staged: list[Item] = []
@@ -336,6 +343,8 @@ class Buffer:
                     self._flush(staged)
                     staged = []
                 exchange = f"{session}.{i}"
+            elif not staged and not exchange:
+                exchange = f"{session}.lead"
             staged.append(Item(session=session, turn=i, role=role, text=text, source=source,
                                exchange=exchange,
                                **(dict() if ts is None else {"ts": ts})))

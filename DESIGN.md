@@ -707,6 +707,14 @@ The id is not in `key()`, so the log's identity is unchanged and an old row
 loads with an empty exchange. Such a row is still replayable and still pairable
 by order; it just carries no exchange label.
 
+A run of turns ahead of any `user` has no owner but is still one flush, so it
+gets an id of the form `session.lead` rather than an empty one — an empty id is
+eviction's standalone marker, and a reload splits a run of them into
+singletons, which picks a different victim than the live draw did. The `lead`
+marker and not the first turn's index, because a resumed session re-sends its
+`user` turn at index 0 and `session.0` would collide with the leading run's
+id, fusing the pair onto the old group on replay.
+
 **Cost and shape.** All of it is sleep-time. `L` is one extra term on the sleep's
 own optimizer, weighted small (`~0.02`) so the replay loss keeps dominating —
 otherwise the slot fits the preference instead of the content. It needs two
@@ -980,6 +988,10 @@ Resolved, with the evidence that closed each one:
   An epoch restarts on any index jump, and a continued exchange id repeats a
   turn key it already holds when a resumed session re-sends itself, which marks
   the copy as a new group instead of fusing the pair into a four-member one.
+  That guard is also why a leading run needs a distinct id: an empty one is the
+  standalone marker and replays as singletons, and the obvious replacement,
+  the first turn's index, can equal a resumed `user` turn's own id and read as
+  a continuation. It is `session.lead` instead (§6.8).
   A promoted row replays too: its admitted copy carries `is_core=False` and
   reserves under its own index, its later core copy is passed over, and the
   core write pulls its key back out of the pool exactly as `bank_core` did —

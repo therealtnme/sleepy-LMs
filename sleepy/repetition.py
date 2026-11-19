@@ -27,12 +27,18 @@ scored on three independent measurements rather than one similarity:
     the same information *said differently*, which is precisely what a stale
     answer fails to do.
 
-The first two are gated and the third is not. `risk = similar * gap * (1 -
-affirm)` puts a verbatim repeat at 0 and an "again" at half, which is wrong for
-the flag: the same answer to the same request under "say that again" is correct,
-so flagging it is a false positive that erodes the trust the guard needs. What
-is gated is therefore `similar` (was it copied?) and `gap` (was a different
-thing asked?), and `affirm` is kept as a measurement on the candidate.
+The flag is the response being *carried over*, so `similar` is a floor — below
+it nothing is copied and there is nothing to judge — and the verdict is then
+made on the requests: `gap > 0` means a different thing was asked and the copy
+is a failure. A re-ask, or a rephrasing that aliases to the same action
+("define X", "what is X"), has `gap` 0.0 and earns no flag even though the
+answer is word-for-word the same. That requests-first order is deliberate:
+judging on wording alone punishes the correct answer to a paraphrase.
+
+`affirm` is the third veto on top, not a threshold: where the repeat was asked
+for verbatim the copy *was* the answer. `risk = similar * gap * (1 - affirm)`
+is reported beside the pair but is not compared — a verbatim copy and an
+asked-for repeat both score it the same.
 
 A flagged pair is a **candidate, not a verdict**: it says a stale-looking
 answer went to a request that does not look like the one it was written for.
@@ -51,7 +57,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .buffer import Item
 
@@ -73,7 +79,8 @@ _STOP = {
     "contrast", "calculate", "compute", "solve", "translate", "summarize",
     "summarise", "recap", "review", "list", "name", "give", "provide", "show",
     "tell", "say", "repeat", "again", "word", "for", "what", "which",
-    "who", "whom", "whose", "where", "when", "why", "how", "about", "of",
+    "who", "whom", "whose", "where", "when", "why", "how", "work", "works",
+    "about", "of",
     "in", "on", "at", "to", "from", "with", "and", "or", "if", "then",
 }
 
@@ -125,6 +132,20 @@ _TRANSFORM = ("simpl", "easy", "easier", "shorter", "brief", "rephrase",
 _NEGATE_FIRST = ("don't repeat", "dont repeat", "do not repeat", "stop repeating",
                  "different explanation", "you've already", "already explained")
 
+# What a user turn says when it is *correcting* the answer above it rather than
+# opening the next exchange. Position alone is ambiguous — a transcript that
+# never replies after an answer puts the next question straight after it — so a
+# bare follow-up is only an unverified correction, and one of these makes it
+# verified. Deliberately the words of a complaint or a restatement of the ask,
+# nothing that a fresh question would also use.
+_CORRECTS = (
+    "that's wrong", "thats wrong", "that is wrong", "not quite", "not right",
+    "incorrect", "no,", "nope", "you repeated", "you're repeating",
+    "you are repeating", "same as before", "same answer", "not what i asked",
+    "not what i was asking", "i asked", "should be", "should have been",
+    "it is", "it's", "actually", "rather", "i meant", "instead",
+)
+
 
 @dataclass
 class Candidate:
@@ -151,19 +172,31 @@ class Candidate:
 
 @dataclass
 class Correction:
-    """A verified answer that addresses the new request, or the reason there is none.
+    """An answer that addresses the new request, or the reason there is none.
 
     The loss term is only paid where `text` is set: penalising a stale response
     without anything to prefer instead teaches the model to say less, not to
     answer the question. `source` records which of the three kinds supplied it
     — a user's own correction is the strongest, then a frozen teacher, then a
     previously recorded answer that matches the request.
+
+    `verified` is the separate question of whether anything vouched that the
+    text actually answers *this* request, and it is what licenses the term.
+    A percent-certainty score would be false precision on lexical evidence, so
+    the field is a flag: a historical answer is verified when its own request
+    is the same one (or shares the subject), a teacher is verified when its
+    output shares a content word with the request, and a user turn is verified
+    only when it carries an explicit correction marker. A user turn without one
+    is still returned — position says it replies to the answer — but as an
+    unverified candidate, because "so anyway, what is a tensor" follows an
+    answer without correcting it.
     """
     text: str | None = None
     source: str = "none"        # "user" | "teacher" | "historical" | "none"
     # The request the correction answers, carried so the loss does not have to
     # find the exchange again. Empty when `text` is None.
     request: str = ""
+    verified: bool = False
 
 
 def _words(text: str) -> list[str]:
@@ -307,18 +340,6 @@ def _negated(text: str) -> bool:
     return bool(_NEGATION.search(text.lower()))
 
 
-def _reask(a: str, b: str) -> bool:
-    """Were the same words put again, so a copy is the right answer?
-
-    Literal, not `gap == 0`. `request_gap` aliases "define X" and "what is X"
-    to one action, and the two can also share a subject, so the gap there is
-    0.0 — yet an aliased ask is a different request and a copied response to it
-    is exactly the shortcut being hunted. Only a repeat of the words themselves
-    seen before proves an unchanged model should have answered the same way.
-    """
-    return _subject(a) == _subject(b) and _words(a) == _words(b)
-
-
 def _stem(word: str) -> str:
     """Drop a trailing plural/3rd-person `s`, so `weights` and `weight` agree."""
     if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
@@ -385,24 +406,54 @@ def exchange_of(items: list[Item], index: int) -> tuple[Item | None, Item | None
     guessed pairing, because a wrong request makes every downstream number
     wrong in the direction that produces false flags.
 
-    Only the run of `user` items directly above the answer counts, so the walk
-    back stops at the first item that is not one. A later user turn is a new
-    request, not a disqualified pairing.
+    Two shapes make "the assistant turn" ambiguous, and both are settled by
+    order rather than by guessing. A `tool` turn is transparent: it is the
+    model's own errand between the ask and the answer, so `user, assistant,
+    tool, assistant` is one exchange answered by the last assistant, and a tool
+    above the ask does not open a new one. An assistant turn with another
+    assistant after it is therefore intermediate, not the reply — which is what
+    keeps "let me check" from being graded as the answer.
+
+    The request is the user turns in the run above, joined: a second user turn
+    continues the ask ("what is a tensor" / "and how do you reshape one"), so
+    both are what the answer had to address, and judging the reply against only
+    the first would call a correct continuation a non-answer. Tool output is
+    not joined — `gap` and `affirm` read the *intent*, and a tool's payload is
+    subject matter rather than an ask.
+
+    The walk back crosses a tool freely, but an assistant only until it has
+    passed a user turn: an assistant with no ask between it and the answer is
+    the same turn's intermediate step, while one with an ask between it is the
+    previous exchange's reply and is the boundary.
     """
     if index < 0 or index >= len(items):
         return None, None
     now = items[index]
     if now.role != "assistant":
         return None, None
+    for it in items[index + 1:]:
+        if it.role == "tool":
+            continue
+        if it.role == "assistant":
+            return None, None
+        break
     lo = index
-    while lo > 0 and items[lo - 1].role == "user":
+    crossed = False
+    while lo > 0:
+        role = items[lo - 1].role
+        if role == "user":
+            crossed = True
+        elif role == "assistant" and crossed:
+            break
+        elif role not in ("user", "tool", "assistant"):
+            break
         lo -= 1
-    # The answer at index 0 is impossible, but its request sits at index 0 too
-    # when nothing above it is a user turn — so the guard has to test the role
-    # of `lo`, not whether the walk moved.
-    if items[lo].role != "user":
+    asks = [it for it in items[lo:index] if it.role == "user"]
+    if not asks:
         return None, None
-    return items[lo], now
+    if len(asks) == 1:
+        return asks[0], now
+    return replace(asks[0], text="\n".join(it.text for it in asks)), now
 
 
 def exchanges(items: list[Item]) -> list[tuple[Item, Item]]:
@@ -417,16 +468,22 @@ def exchanges(items: list[Item]) -> list[tuple[Item, Item]]:
     return out
 
 
-def pairs(items: list[Item], risk_min: float, max_pairs: int = 64) -> list[Candidate]:
+def pairs(items: list[Item], risk_min: float, max_pairs: int = 64,
+          window: int = 8) -> list[Candidate]:
     """Later answers whose response looks carried over from an earlier exchange.
 
     Swept newest-first over the bounded exchange list and stopped at
     `max_pairs`, so the cost is a constant in the buffer's size — a large
-    history must not turn one sleep into a quadratic scan. Each candidate is
-    scored against the exchange immediately before it, because that is the
-    answer sitting in front of the model when the next request arrives, and
-    the shortcut `similar topic -> repeat the last answer` copies exactly
-    that one.
+    history must not turn one sleep into a quadratic scan.
+
+    Each candidate is scored against the `window` exchanges before it and
+    keeps the most similar, not only the one immediately before. Adjacent-only
+    misses the loop this exists for: A, B, A hands the third answer back to an
+    exchange whose answer was B, and the repetition of A looks like an ordinary
+    change against it. Taking the best match also fixes the request the pair is
+    judged against — it is the request the copied answer was actually written
+    for, so a copy from three exchanges back is compared with the ask that
+    earned it rather than with the one in between.
 
     A candidate is a *measurement*: everything whose response merely looks
     copied (`similar >= risk_min`), scored but not yet judged. The three
@@ -439,35 +496,45 @@ def pairs(items: list[Item], risk_min: float, max_pairs: int = 64) -> list[Candi
     ex = exchanges(items)
     out: list[Candidate] = []
     for i in range(len(ex) - 1, 0, -1):
-        prev_req, prev_res = ex[i - 1]
         now_req, now_res = ex[i]
-        if prev_res.key() == now_res.key():
-            continue
-        sim = response_similarity(prev_res.text, now_res.text)
-        if sim < risk_min:
-            continue
-        out.append(Candidate(prev=prev_res, now=now_res, similar=sim,
+        best = None
+        for j in range(i - 1, max(-1, i - 1 - window), -1):
+            prev_req, prev_res = ex[j]
+            if prev_res.key() == now_res.key():
+                continue
+            sim = response_similarity(prev_res.text, now_res.text)
+            if sim < risk_min or (best is not None and sim <= best.similar):
+                continue
+            best = Candidate(prev=prev_res, now=now_res, similar=sim,
                              gap=request_gap(prev_req.text, now_req.text),
                              affirm=permission(now_req.text),
-                             prev_req=prev_req.text, now_req=now_req.text))
+                             prev_req=prev_req.text, now_req=now_req.text)
+        if best is None:
+            continue
+        out.append(best)
         if len(out) >= max_pairs:
             break
     return out
 
 
-def flagged(items: list[Item], risk_min: float, max_pairs: int = 64) -> list[Candidate]:
+def flagged(items: list[Item], risk_min: float, max_pairs: int = 64,
+            window: int = 8) -> list[Candidate]:
     """The candidates that are the failure — the detection stage's output.
 
-    Two vetoes, each removing one way of being a false positive: the request
-    must have been put afresh (`not _reask` — the same words to an unchanged
-    model are right to earn the same answer), and the repeat must not have been
-    asked for verbatim (`affirm < 1.0` — the copy was the answer). Neither is a
-    threshold on `risk`: the verbatim copy this subsystem exists for scores
-    `gap` 0.8 and the asked-for repeat scores the same 0.8, so a product cutoff
-    cannot separate them.
+    A copy is only a failure where the request *diverged*, so `gap > 0` is the
+    gate: the same subject with the same action (a re-ask, or "define X" and
+    "what is X") wants the same answer and earns no flag, while a changed
+    action over one subject (0.4), a new subject (0.8) and a polarity flip
+    (1.0) all do. Judging the request rather than the wording is what stops the
+    detector punishing a correct paraphrase.
+
+    `affirm < 1.0` removes the second false positive: where a repeat was asked
+    for verbatim the copy *was* the answer. Neither veto is a threshold on
+    `risk` — the verbatim copy this subsystem exists for scores `gap` 0.8, and
+    so does an asked-for repeat, so no product cutoff separates them.
     """
-    return [c for c in pairs(items, risk_min, max_pairs)
-            if c.affirm < 1.0 and not _reask(c.prev_req, c.now_req)]
+    return [c for c in pairs(items, risk_min, max_pairs, window)
+            if c.affirm < 1.0 and c.gap > 0.0]
 
 
 def _pair_key(cand: Candidate) -> str:
@@ -482,7 +549,8 @@ def _pair_key(cand: Candidate) -> str:
 
 
 def _streaks(items: list[Item], risk_min: float, known: dict[str, int],
-             steps: int, max_pairs: int = 64) -> tuple[dict[str, int], list[Candidate], int]:
+             steps: int, max_pairs: int = 64,
+             window: int = 8) -> tuple[dict[str, int], list[Candidate], int]:
     """Rebuild the streak table from this window alone: (table, matured, flags).
 
     Rebuilt rather than aged, so a pair that stops looking stale stops being
@@ -492,7 +560,7 @@ def _streaks(items: list[Item], risk_min: float, known: dict[str, int],
     """
     table: dict[str, int] = {}
     matured: list[Candidate] = []
-    returned = flagged(items, risk_min, max_pairs)
+    returned = flagged(items, risk_min, max_pairs, window)
     for cand in returned:
         key = _pair_key(cand)
         table[key] = known.get(key, 0) + 1
@@ -503,14 +571,14 @@ def _streaks(items: list[Item], risk_min: float, known: dict[str, int],
 
 def _exchanges(items: list[Item], risk_min: float, known: dict[str, int],
                steps: int, teacher: Callable[[str], str] | None = None,
-               max_pairs: int = 64,
+               max_pairs: int = 64, window: int = 8,
                ) -> tuple[dict[str, int], list[tuple[Candidate, Correction]], int]:
     """Streak update plus a correction for every matured flag.
 
     Split out so a caller that only wants the flag (stage one, guard off) does
     not pay for a teacher call per candidate.
     """
-    table, matured, flags = _streaks(items, risk_min, known, steps, max_pairs)
+    table, matured, flags = _streaks(items, risk_min, known, steps, max_pairs, window)
     out = [(c, correct(c, items, teacher)) for c in matured]
     return table, out, flags
 
@@ -576,20 +644,47 @@ def _correction_shaped(text: str) -> bool:
     return len(_words(text)) >= 3
 
 
+def _explicit(text: str) -> bool:
+    """Does the correction-shaped turn *say* it is correcting, or merely follow?"""
+    low = text.lower()
+    return any(marker in low for marker in _CORRECTS)
+
+
+def _is_answer(text: str, stale: str) -> bool:
+    """Does a teacher's generation read as a substitution for the stale answer?
+
+    Structural rather than topical, because a correct answer normally shares no
+    vocabulary with its own request — "why does gradient descent work" is
+    answered "the loss falls fastest downhill" — so a subject-overlap test
+    would reject most good generations. What it can establish is that a real
+    answer came back: three content words or more, and not the stale text
+    again, which `generate` reproduces whenever the context leads it back to
+    the answer being complained about. A one- or two-word answer is treated as
+    a fragment and left unverified.
+    """
+    body = _subject(text)
+    return len(body.split()) >= 3 and body.strip() != _subject(stale).strip()
+
+
 def correct(cand: Candidate, items: list[Item],
             teacher: Callable[[str], str] | None = None) -> Correction:
     """An answer the new request actually deserves, in descending order of trust.
 
-    historical > teacher > user. A historical answer is one this model already
-    had, and it was returned for essentially this subject, so it is the case
-    actually worth preferring. The frozen teacher's opinion comes next: never
-    stale, but weaker than the model's own work because it is the base model
-    talking about a subject this slot may have learned. A user turn that
-    follows an answer is the thinnest check of all — position alone says it is
-    a correction — and is used only when nothing better exists. The one
-    exception is a request that asks for a *different* answer (a transform), so
-    a history or a teacher that would hand back the same text adds nothing and
-    the user turn goes first.
+    historical, then an explicit user correction, then a teacher, then a user
+    turn that merely follows. A historical answer is one this model already
+    had, and it was returned for essentially this subject, so its own request
+    *is* the verification and it wins outright. A user's "no, it's ..." is the
+    next strongest: it is what was actually wanted, said in their own words.
+    The frozen teacher comes after it — never stale, but the base model talking
+    about a subject this slot may have learned, and checkable only for shape.
+    A user turn with no correction marker is last: position alone says it
+    replies to the answer, and in a transcript that never replies after an
+    answer it is simply the next question.
+
+    Every branch except the bare follow-up carries its own verification. Where
+    none of them is available the best guess is still returned, `verified`
+    False, so the caller can count the gamble rather than treat a guess as a
+    correction.
 
     One thing can never be the correction: the stale answer itself. A history
     qualifies only when it answers this request — its own request is the same
@@ -614,12 +709,12 @@ def correct(cand: Candidate, items: list[Item],
         return Correction()
     request = req.text
     wanted_new = repeat_intent(request)[0] in ("transform", "brief", "recall")
-    if wanted_new:
-        user = _user_correction(items, i, request)
-        if user.text is not None:
-            return user
+    user = _user_correction(items, i, request)
+    if wanted_new and user.text is not None:
+        return user
     # Backwards, so the *later* earlier answer wins: it is the freshest one and
-    # the one nearest the regression.
+    # the one nearest the regression. Both limbs of the test *are* the
+    # verification, so this branch always returns verified.
     for j in range(i - 1, -1, -1):
         if items[j].role != "assistant":
             continue
@@ -629,24 +724,42 @@ def correct(cand: Candidate, items: list[Item],
             continue
         if (_asked_about(items, j, request)
                 or _stock_fits(items, j, cand)):
-            return Correction(items[j].text, "historical", request)
+            return Correction(items[j].text, "historical", request, verified=True)
+    # An explicit user correction is what was actually wanted, and a teacher is
+    # only checked for *shape* — that a real answer came back rather than a
+    # fragment or the stale text again — because a correct answer normally
+    # shares no words with its own request. So the user's marker is the
+    # stronger evidence and has to be spent before the teacher gets a turn.
+    if user.verified:
+        return user
     if teacher is not None:
-        return Correction(teacher(request), "teacher", request)
-    return _user_correction(items, i, request)
+        said = (teacher(request) or "").strip()
+        if said:
+            return Correction(said, "teacher", request,
+                          verified=_is_answer(said, cand.now.text))
+    return user
 
 
 def _user_correction(items: list[Item], i: int, request: str) -> Correction:
     """The first user turn after the answer, if it reads as a correction of it.
 
-    Last for an ordinary request, because position alone is the whole evidence
-    and in a transcript that never replies after an answer the next user turn
-    is simply the next question. For a transform it goes first: the user said
-    what they wanted, and no other source can.
+    Last for an ordinary request, because position alone is weak evidence and in
+    a transcript that never replies after an answer the next user turn is
+    simply the next question. For a transform it goes first: the user said what
+    they wanted, and no other source can. `verified` only when the turn names
+    the correction ("no, ...", "it's more like ..."); otherwise it is a guess.
+
+    A `tool` turn is transparent here too: an errand the model ran after the
+    answer does not end the turn that answers it. Only a non-tool, non-user
+    turn does, so the walk stops at the first real boundary rather than at the
+    first tool result.
     """
     for nxt in items[i + 1:]:
+        if nxt.role == "tool":
+            continue
         if nxt.role != "user":
             break
         if _correction_shaped(nxt.text):
-            return Correction(nxt.text, "user", request)
+            return Correction(nxt.text, "user", request, verified=_explicit(nxt.text))
         break
     return Correction()

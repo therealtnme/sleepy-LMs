@@ -300,6 +300,34 @@ def blend(prev: Readout | None, new: Readout | None, alpha: float) -> Readout | 
     return out
 
 
+def eligible(scores: Readout | None, prev: Readout | None,
+             new: Readout | None) -> Readout | None:
+    """Merge two `measured` masks across a blend.
+
+    A blended score is trusted only where one of the two windows probed it: a
+    placeholder fill can look dead and frozen at once, which is exactly the
+    component a reinit must not act on. `blend` already leaves an unprobed
+    module at its history, so the masks are taken together the same way. With
+    no history the new mask stands, and with neither there is nothing to say.
+    """
+    if scores is None:
+        return None
+    if prev is None:
+        return new
+    if new is None:
+        return prev
+    out = {}
+    for name in scores:
+        a, b = prev.get(name), new.get(name)
+        if a is None:
+            out[name] = b
+        elif b is None:
+            out[name] = a
+        else:
+            out[name] = a | b
+    return out
+
+
 def keep_mask(importance: torch.Tensor, drop: float) -> torch.Tensor | None:
     """1.0 for the components to keep, 0.0 for the `drop` lowest-scored ones.
 
@@ -467,7 +495,8 @@ def stale_mask(importance: Readout | None, plasticity: Readout | None,
     return out or None
 
 
-def reinitialize(pm, adapter: str, masks: Readout) -> list[tuple]:
+def reinitialize(pm, adapter: str, masks: Readout,
+                 steps: int | None = None) -> list[tuple]:
     """Blank the masked components of each named module; return enough to undo it.
 
     Per component, the `aᵢ` row takes a fresh kaiming draw and the `bᵢ` column
@@ -478,7 +507,9 @@ def reinitialize(pm, adapter: str, masks: Readout) -> list[tuple]:
 
     Zeroing `bᵢ` means the component contributes exactly nothing until it is
     trained, so this can only lose whatever the removed components carried —
-    which is what the caller's before/after check is for.
+    which is what the caller's before/after check is for. `steps` is the number
+    of steps left to train the blanked rows, where the caller knows it; it is
+    the same draw either way and only marks a mid-window blank from a final one.
     """
     saved = []
     with torch.no_grad():
@@ -500,6 +531,20 @@ def reinitialize(pm, adapter: str, masks: Readout) -> list[tuple]:
             else:
                 p[:, idx] = 0.0
     return saved
+
+
+def trigger_step(reinit_at: float, budget: int) -> int | None:
+    """The 1-based step a mid-window reinit blanks at, or `None` for the end.
+
+    Clamped to the last step so a fraction just under 1.0 still has a step to
+    land on, and `None` at exactly 1.0 so the caller keeps the end-of-window
+    path — which judges the blank by its loss alone rather than by what a later
+    step could train into it.
+    """
+    if reinit_at <= 0.0 or budget < 1:
+        return None
+    step = max(1, min(budget, int(budget * reinit_at)))
+    return None if step >= budget else step
 
 
 def restore(saved: list[tuple]) -> None:

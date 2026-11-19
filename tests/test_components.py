@@ -8,6 +8,7 @@ measures, and redundancy is found by the pair pass.
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from sleepy import components
@@ -20,8 +21,9 @@ from tests.conftest import StubTokenizer
 
 
 def _cfg(**kw):
-    return SleepConfig(tokenizer=StubTokenizer(), seq_len=16, budget_steps=2,
-                       passes=1, batch_items=4, **kw)
+    return SleepConfig(**{"tokenizer": StubTokenizer(), "seq_len": 16,
+                          "budget_steps": 2, "passes": 1, "batch_items": 4,
+                          **kw})
 
 
 def _batch(buffer, cfg=None):
@@ -637,7 +639,7 @@ def test_reinit_lands_in_the_sleep_report(pm, ladder, buffer):
                    reinit_loss_tol=1e9))
 
     assert rep.reinitialized == _components(pm, 2) and rep.reinit_reverted == 0
-    for key in ("reinitialized", "reinit_reverted", "comp_disp"):
+    for key in ("reinitialized", "reinit_reverted", "reinit_trained", "comp_disp"):
         assert key in rep.row()
 
 
@@ -717,3 +719,76 @@ def test_a_reinit_that_would_cost_loss_is_reverted(pm, ladder, buffer, monkeypat
     assert rep.reinit_reverted == _components(pm, 2) and rep.reinitialized == 0
     for n, p in pm.named_parameters():
         assert torch.equal(p.detach(), seen["before"][n])
+
+
+# -- mid-window reinit --------------------------------------------------
+@pytest.mark.parametrize("at,shown", [
+    (0.0, None), (0.5, 2), (0.9, 4), (1.0, None), (2.0, None)])
+def test_the_trigger_is_the_step_the_fraction_names(at, shown):
+    assert components.trigger_step(at, 5) == shown
+
+
+def test_the_window_trains_the_component_the_blank_redrew(pm, ladder, buffer,
+                                                          monkeypatch):
+    """A mid-window reinit is only worth anything if a step follows it.
+
+    No tolerance and a deliberately bad draw: a blank trained on the window's
+    own batch does not revert, one trained badly does. The slot is trained
+    first — a freshly-opened adapter contributes nothing, so blanking it would
+    cost nothing and there would be no difference to judge.
+    """
+    real = components.reinitialize
+    draw = {"up": True}
+
+    def fixed(pm_, adapter, mask, steps=None):
+        def kaiming(t, a=0.0, **_):
+            if draw["up"]:
+                t.fill_(8.0)
+            else:
+                t.fill_(1e-5)
+        monkeypatch.setattr(torch.nn.init, "kaiming_uniform_", kaiming)
+        return real(pm_, adapter, mask, steps)
+
+    monkeypatch.setattr(components, "reinitialize", fixed)
+    # A first window with no reinit, so the slot carries something worth losing.
+    run(pm, ladder, buffer, ladder.slots[2], _cfg(budget_steps=40))
+    wide = dict(reinit=True, reinit_importance=1.0, reinit_movement=1.0,
+                reinit_loss_tol=0.0, reinit_at=0.4, budget_steps=12, lr=0.2)
+
+    trained = run(pm, ladder, buffer, ladder.slots[2], _cfg(**wide))
+    assert trained.reinitialized == _components(pm, 2)
+    assert trained.reinit_reverted == 0 and trained.reinit_trained > 0
+
+    draw["up"] = False
+    broken = run(pm, ladder, buffer, ladder.slots[2], _cfg(**wide))
+    assert broken.reinitialized == 0
+    assert broken.reinit_reverted == _components(pm, 2)
+    assert broken.reinit_trained > 0         # it trained, and still lost
+
+
+def test_at_the_end_of_the_budget_nothing_trains_after_the_blank(pm, ladder, buffer):
+    rep = run(pm, ladder, buffer, ladder.slots[2],
+              _cfg(reinit=True, reinit_importance=1.0, reinit_movement=1.0,
+                   reinit_loss_tol=1e9, reinit_at=1.0))
+
+    assert rep.reinitialized == _components(pm, 2)
+    assert rep.reinit_trained == 0
+
+
+def test_turning_the_fraction_down_moves_the_blank_earlier(pm, ladder, buffer):
+    seen = []
+    real = components.reinitialize
+
+    def record(pm_, adapter, mask, steps=None):
+        seen.append(steps)
+        return real(pm_, adapter, mask, steps)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(components, "reinitialize", record)
+        run(pm, ladder, buffer, ladder.slots[2],
+            _cfg(reinit=True, reinit_importance=1.0, reinit_movement=1.0,
+                 reinit_at=0.4, budget_steps=5))
+
+    # Blanked at step 2 of 5, so three steps are left to train it — and the
+    # end-of-window path did not blank a second time.
+    assert seen == [3]

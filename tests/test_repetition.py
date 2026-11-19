@@ -5,6 +5,7 @@ from __future__ import annotations
 import tempfile
 
 import pytest
+import torch
 
 from sleepy import ladder as lad
 from sleepy import repetition, sleep
@@ -40,15 +41,68 @@ def test_a_verbatim_repeat_of_one_request_is_not_flagged():
     assert repetition.flagged(items, 0.5) == []
 
 
-def test_a_related_ask_that_was_read_as_the_same_request_is_still_flagged():
+def test_a_paraphrased_same_request_is_not_flagged():
     # "define" and "what is" alias to one action and the subject survives, so
-    # only the responses are left to tell the two requests apart.
+    # the gap is 0.0: the same answer is right, however the words differ.
     items = [item(0, "user", "define a tensor"),
              item(1, "assistant", "an array of numbers"),
              item(2, "user", "what is a tensor"),
              item(3, "assistant", "an array of numbers")]
-    assert repetition.request_gap("define a tensor", "what is a tensor") < 0.4
-    assert len(repetition.flagged(items, 0.5)) == 1
+    assert repetition.request_gap("define a tensor", "what is a tensor") == 0.0
+    assert repetition.flagged(items, 0.5) == []
+
+
+def test_a_changed_action_over_one_subject_is_flagged():
+    # The definition does not answer "how does it work", even though every
+    # content word survives. This is the failure the subsystem exists for.
+    items = [item(0, "user", "what is gradient descent"),
+             item(1, "assistant", "an optimization step along the loss gradient"),
+             item(2, "user", "how does gradient descent work"),
+             item(3, "assistant", "an optimization step along the loss gradient")]
+    pair, = repetition.flagged(items, 0.5)
+    assert pair.gap == 0.4
+
+
+def test_a_polarity_flip_over_one_subject_is_flagged():
+    items = [item(0, "user", "why does gradient descent work"),
+             item(1, "assistant", "because the loss falls along the gradient"),
+             item(2, "user", "why does gradient descent not work"),
+             item(3, "assistant", "because the loss falls along the gradient")]
+    pair, = repetition.flagged(items, 0.5)
+    assert pair.gap == 1.0
+
+
+def test_an_answer_reused_after_a_detour_is_caught():
+    # A, B, A: the third answer repeats the first, so the exchange immediately
+    # before it holds B and an adjacent-only scan sees an ordinary change. The
+    # back-scan has to reach past the detour, and then judge against the request
+    # the copy was written for rather than the one in between.
+    items = [item(0, "user", "what is a tensor"),
+             item(1, "assistant", "an array of numbers with a shape and a dtype"),
+             item(2, "user", "how does matrix multiplication work"),
+             item(3, "assistant", "rows scaled by columns and summed"),
+             item(4, "user", "how does gradient descent adjust the weights"),
+             item(5, "assistant", "an array of numbers with a shape and a dtype")]
+    pair, = repetition.flagged(items, 0.5)
+    assert pair.prev.turn == 1 and pair.now.turn == 5
+    assert pair.now_req == "how does gradient descent adjust the weights"
+    # One step back lands on B, which the copy does not resemble.
+    assert repetition.flagged(items, 0.5, window=1) == []
+    assert len(repetition.flagged(items, 0.5, window=2)) == 1
+
+
+def test_the_window_stops_short_of_a_far_copy():
+    # A, B, C, A: three exchanges back is outside a window of two.
+    items = [item(0, "user", "what is a tensor"),
+             item(1, "assistant", "an array of numbers with a shape and a dtype"),
+             item(2, "user", "how does matrix multiplication work"),
+             item(3, "assistant", "rows scaled by columns and summed"),
+             item(4, "user", "what does the attention head mix"),
+             item(5, "assistant", "a weighted blend of the value vectors"),
+             item(6, "user", "how does gradient descent adjust the weights"),
+             item(7, "assistant", "an array of numbers with a shape and a dtype")]
+    assert repetition.flagged(items, 0.5, window=2) == []
+    assert len(repetition.flagged(items, 0.5, window=3)) == 1
 
 
 def test_the_same_answer_to_a_different_request_is_flagged():
@@ -97,6 +151,79 @@ def test_pairs_stop_at_an_exchange_without_an_answer():
     assert repetition.pairs(items, 0.5) == []
 
 
+# -- exchange shape ------------------------------------------------------
+def test_a_tool_result_between_ask_and_answer_is_transparent():
+    # `user, assistant, tool, assistant` is one exchange: the first answer is a
+    # step, the tool is its errand, and the last assistant is the reply. Grading
+    # "let me check" as the answer would compare a preamble against the copy.
+    items = [item(0, "user", "what is a tensor"),
+             item(1, "assistant", "let me check"),
+             item(2, "tool", "tensor: an array of numbers"),
+             item(3, "assistant", "an array of numbers")]
+    pair, = repetition.exchanges(items)
+    assert (pair[0].turn, pair[1].turn) == (0, 3)
+    # And it works through detection: the same answer to a new ask is flagged.
+    items += [item(4, "user", "why does gradient descent work")]
+    items.append(item(5, "assistant", "an array of numbers"))
+    flagged = repetition.flagged(items, 0.5)
+    assert [c.now.turn for c in flagged] == [5]
+
+
+def test_a_tool_turn_does_not_rename_the_request():
+    # The tool's payload is subject matter, not an ask, so it must not enter the
+    # request text the gap is judged against.
+    items = [item(0, "user", "what is a tensor"),
+             item(1, "tool", "shape, dtype, device, strides"),
+             item(2, "assistant", "an array of numbers")]
+    pair, = repetition.exchanges(items)
+    assert pair[0].text == "what is a tensor"
+
+
+def test_a_continuation_turn_is_part_of_the_request():
+    # A second user turn continues the ask, so both are what the answer had to
+    # address. Judged against the first alone, the continuation reads as the
+    # same request and a carried answer passes; against both, the new demand
+    # ("how do you reshape one") is a gap.
+    items = [item(0, "user", "what is a tensor"),
+             item(1, "assistant", "an array of numbers with a shape"),
+             item(2, "user", "what is a tensor"),
+             item(3, "user", "and how do you reshape one"),
+             item(4, "assistant", "an array of numbers with a shape")]
+    pair, = repetition.exchanges(items)[1:]
+    assert pair[0].text == "what is a tensor\nand how do you reshape one"
+    # Against the first turn alone the two asks are identical (gap 0.0) and the
+    # copy passes; the joined request carries the second demand, so it is a gap.
+    assert repetition.request_gap("what is a tensor", "what is a tensor") == 0.0
+    assert repetition.flagged(items, 0.5)[0].gap == 0.8
+
+
+def test_a_tool_result_between_answer_and_correction_does_not_lose_it():
+    # The errand ran after the answer; the user turn still replies to it.
+    items = [item(0, "user", "how does gradient descent adjust the weights"),
+             item(1, "assistant", "it nudges the weights along the negative gradient"),
+             item(2, "user", "why does gradient descent work"),
+             item(3, "assistant", "it nudges the weights along the negative gradient"),
+             item(4, "tool", "lookup ok"),
+             item(5, "user", 'no, it\'s because the loss falls fastest that way')]
+    got = repetition.correct(repetition.flagged(items, 0.5)[0], items)
+    assert (got.source, got.verified) == ("user", True)
+
+
+def test_a_tool_copy_is_still_caught_across_the_run():
+    # A, B, A with a tool inside B's exchange: the back walk crosses the tool
+    # and B's answer, and judges the copy against the ask it was written for.
+    items = [item(0, "user", "what is a tensor"),
+             item(1, "assistant", "an array of numbers with a shape and a dtype"),
+             item(2, "user", "how does matrix multiplication work"),
+             item(3, "assistant", "rows scaled by columns and summed"),
+             item(4, "tool", "matrix: rows x cols"),
+             item(5, "user", "how does gradient descent adjust the weights"),
+             item(6, "assistant", "an array of numbers with a shape and a dtype")]
+    pair, = repetition.flagged(items, 0.5)
+    assert (pair.prev.turn, pair.now.turn) == (1, 6)
+    assert pair.prev_req == "what is a tensor"
+
+
 # -- correction ---------------------------------------------------------
 def test_a_user_correction_is_the_last_resort():
     # Nothing earlier answers this subject, so the user's follow-up is the only
@@ -110,12 +237,60 @@ def test_a_user_correction_is_the_last_resort():
     assert got.source == "user"
     assert got.text == "because the loss falls fastest that way"
     assert got.request == "why does gradient descent work"
+    assert got.verified is False
 
 
 def test_a_teacher_fills_in_when_the_history_has_nothing():
     got = repetition.correct(repetition.flagged(transcript(), 0.5)[0], transcript(),
+                             teacher=lambda q: "the loss falls fastest downhill")
+    assert (got.source, got.text) == ("teacher", "the loss falls fastest downhill")
+    assert got.verified is True
+
+
+def test_a_teacher_fragment_is_unverified():
+    got = repetition.correct(repetition.flagged(transcript(), 0.5)[0], transcript(),
                              teacher=lambda q: "T")
-    assert (got.source, got.text) == ("teacher", "T")
+    assert (got.source, got.verified) == ("teacher", False)
+
+
+def test_a_teacher_that_merely_repeats_the_stale_answer_is_unverified():
+    got = repetition.correct(repetition.flagged(transcript(), 0.5)[0], transcript(),
+                             teacher=lambda q: "it nudges the weights along the negative gradient")
+    assert got.verified is False
+
+
+def test_a_user_correction_without_a_marker_is_unverified():
+    # It follows the answer, so it is the only candidate, but it opens with the
+    # next question rather than restating the ask.
+    items = [item(0, "user", "how does gradient descent adjust the weights"),
+             item(1, "assistant", "it nudges the weights along the negative gradient"),
+             item(2, "user", "why does gradient descent work"),
+             item(3, "assistant", "it nudges the weights along the negative gradient"),
+             item(4, "user", "because the loss falls fastest that way")]
+    got = repetition.correct(repetition.flagged(items, 0.5)[0], items)
+    assert (got.source, got.text) == ("user", "because the loss falls fastest that way")
+    assert got.verified is False
+
+
+def test_an_explicit_user_correction_is_verified():
+    items = [item(0, "user", "how does gradient descent adjust the weights"),
+             item(1, "assistant", "it nudges the weights along the negative gradient"),
+             item(2, "user", "why does gradient descent work"),
+             item(3, "assistant", "it nudges the weights along the negative gradient"),
+             item(4, "user", "no, it's because the loss falls fastest that way")]
+    got = repetition.correct(repetition.flagged(items, 0.5)[0], items)
+    assert (got.source, got.verified) == ("user", True)
+
+
+def test_a_verified_user_turn_beats_a_teacher_on_another_subject():
+    items = [item(0, "user", "how does gradient descent adjust the weights"),
+             item(1, "assistant", "it nudges the weights along the negative gradient"),
+             item(2, "user", "why does gradient descent work"),
+             item(3, "assistant", "it nudges the weights along the negative gradient"),
+             item(4, "user", "no, it's because the loss falls fastest that way")]
+    got = repetition.correct(repetition.flagged(items, 0.5)[0], items,
+                             teacher=lambda q: "the estuary floods in spring")
+    assert (got.source, got.text) == ("user", "no, it's because the loss falls fastest that way")
 
 
 def test_a_teacher_beats_a_history_that_does_not_fit():
@@ -184,7 +359,7 @@ def rep_buffer(workdir):
         ("assistant", "it nudges the weights along the negative gradient", "model"),
         ("user", "why does gradient descent work", "user"),
         ("assistant", "it nudges the weights along the negative gradient", "model"),
-        ("user", "because the loss falls fastest downhill", "user"),
+        ("user", "it's because the loss falls fastest downhill", "user"),
     ])
     return buf
 
@@ -192,10 +367,12 @@ def rep_buffer(workdir):
 def cfg_for(pm, **kw):
     from tests.conftest import StubTokenizer
 
-    # `seq_len` fits a request plus an answer: the stub tokenizes one token per
-    # character, so the correction pairs here are 70-80 long, and a window that
-    # cut them would leave `answer_logprob` nothing to score.
-    return sleep.SleepConfig(tokenizer=StubTokenizer(), seq_len=96, budget_steps=2,
+    # `seq_len` fits a whole framed pair: the stub tokenizes one token per
+    # character and `_turns` spends ~25 on the `<|role|>` header and tag, so a
+    # request plus answer is 90-125. Too small a window would truncate the
+    # answer being scored, and once it fits within the request there is nothing
+    # left for `answer_logprob` at all.
+    return sleep.SleepConfig(tokenizer=StubTokenizer(), seq_len=160, budget_steps=2,
                              passes=1, batch_items=2, components=False, **kw)
 
 
@@ -218,7 +395,25 @@ def test_the_streak_pays_once_it_is_reached(pm, ladder, rep_buffer):
                     cfg_for(pm, repetition_guard=True, repetition_loss_steps=1))
     assert rep.repetition_paid == 1
     assert rep.repetition_uncorrected == 0
+    assert rep.repetition_unverified == 0
     assert rep.repetition_loss == rep.repetition_loss   # not NaN: the term ran
+
+
+def test_an_unverified_correction_is_not_paid(pm, ladder, rep_buffer):
+    # Same buffer, but the user reply loses its marker: position alone is not
+    # enough, so the flag matures and nothing is paid.
+    buf = Buffer(tempfile.mkdtemp() + "/u.jsonl", capacity=64)
+    buf.add_turns(1, [
+        ("user", "how does gradient descent adjust the weights", "user"),
+        ("assistant", "it nudges the weights along the negative gradient", "model"),
+        ("user", "why does gradient descent work", "user"),
+        ("assistant", "it nudges the weights along the negative gradient", "model"),
+        ("user", "because the loss falls fastest downhill", "user"),
+    ])
+    rep = sleep.run(pm, ladder, buf, ladder.slots[0],
+                    cfg_for(pm, repetition_guard=True, repetition_loss_steps=1))
+    assert rep.repetition_flags == 1
+    assert (rep.repetition_paid, rep.repetition_unverified) == (0, 1)
 
 
 def test_a_flag_with_no_correction_is_counted_apart(pm, ladder):
@@ -235,6 +430,93 @@ def test_a_flag_with_no_correction_is_counted_apart(pm, ladder):
     assert rep.repetition_flags == 1
     assert rep.repetition_paid == 0
     assert rep.repetition_uncorrected == 1
+
+
+def test_a_paid_correction_reports_offered_and_applied(pm, ladder, rep_buffer):
+    rep = sleep.run(pm, ladder, rep_buffer, ladder.slots[0],
+                    cfg_for(pm, repetition_guard=True, repetition_loss_steps=1))
+    assert (rep.repetition_flags, rep.repetition_corrected) == (1, 1)
+    assert (rep.repetition_applied, rep.repetition_skipped) == (1, 0)
+    assert rep.repetition_paid == rep.repetition_applied
+
+
+def test_detection_without_training_reports_and_pays_nothing(pm, ladder, rep_buffer,
+                                                             monkeypatch):
+    # Stage one of the rollout: the flag and the correction are still tallied,
+    # so a collection run says what a training run would have done, but no
+    # weight moves and nothing is paid. `contrast` never being called is the
+    # point — its two forwards are the whole cost of the term.
+    def boom(*_, **__):
+        raise AssertionError("the term was built with training off")
+
+    monkeypatch.setattr(sleep, "contrast", boom)
+    # `run` does not reset a slot, so the second window is put back on the
+    # first one's exact start (weights and RNG) to make the two comparable.
+    lora = [(n, p) for n, p in pm.named_parameters()
+            if "lora_A" in n or "lora_B" in n]
+    start = {n: p.detach().clone() for n, p in lora}
+
+    def reset():
+        for n, p in lora:
+            p.data.copy_(start[n])
+        torch.manual_seed(0)
+
+    muted = sleep.run(pm, ladder, rep_buffer, ladder.slots[0],
+                      cfg_for(pm, repetition_guard=True, repetition_loss_steps=1,
+                              repetition_train=False))
+    reset()
+    # Same sleep with the detector off entirely: equal losses from one start
+    # mean the flag cost the weights nothing.
+    monkeypatch.undo()
+    bare = sleep.run(pm, ladder, rep_buffer, ladder.slots[0],
+                     cfg_for(pm, repetition_guard=True, repetition_train=False))
+    assert (muted.repetition_flags, muted.repetition_corrected) == (1, 1)
+    assert (muted.repetition_applied, muted.repetition_paid) == (1, 0)
+    assert muted.repetition_loss != muted.repetition_loss   # NaN: the term never ran
+    assert (muted.loss_first, muted.loss_last) == (bare.loss_first, bare.loss_last)
+
+
+def test_a_pair_too_long_for_the_window_is_skipped_not_counted_applied(pm, ladder,
+                                                                       rep_buffer):
+    # 20 tokens cannot hold the ~25-token header plus any answer, so every
+    # pair is filtered before the loop. `corrected` keeps what detection
+    # offered and `skipped` says why none of it was applied.
+    rep = sleep.run(pm, ladder, rep_buffer, ladder.slots[0],
+                    cfg_for(pm, repetition_guard=True, repetition_loss_steps=1,
+                            repetition_max_len=20))
+    assert (rep.repetition_flags, rep.repetition_corrected) == (1, 1)
+    assert (rep.repetition_applied, rep.repetition_skipped) == (0, 1)
+    assert (rep.repetition_paid, rep.repetition_loss) == (0, rep.repetition_loss)
+    assert rep.repetition_loss != rep.repetition_loss     # NaN: nothing ran
+
+
+def test_a_pair_that_cannot_be_scored_is_counted_skipped(pm, ladder, rep_buffer,
+                                                         monkeypatch):
+    # The length filter passes it and the forward still refuses, which is the
+    # case `applied` would otherwise absorb into a smaller mean.
+    monkeypatch.setattr(sleep, "answer_logprob", lambda *_, **__: None)
+    rep = sleep.run(pm, ladder, rep_buffer, ladder.slots[0],
+                    cfg_for(pm, repetition_guard=True, repetition_loss_steps=1))
+    assert (rep.repetition_corrected, rep.repetition_applied) == (1, 0)
+    assert (rep.repetition_skipped, rep.repetition_paid) == (1, 0)
+
+
+def test_a_tool_interleaved_window_still_detects_and_pays(pm, ladder, workdir):
+    # The whole path with a tool result in it: detection pairs across the tool
+    # and the correction is found past it, so the term is offered and paid.
+    buf = Buffer(workdir / "tool.jsonl", capacity=64, seed=0)
+    buf.add_turns(1, [
+        ("user", "how does gradient descent adjust the weights", "user"),
+        ("assistant", "it nudges the weights along the negative gradient", "model"),
+        ("user", "why does gradient descent work", "user"),
+        ("assistant", "it nudges the weights along the negative gradient", "model"),
+        ("tool", "lookup ok", "tool"),
+        ("user", "no, it's because the loss falls fastest downhill", "user"),
+    ])
+    rep = sleep.run(pm, ladder, buf, ladder.slots[0],
+                    cfg_for(pm, repetition_guard=True, repetition_loss_steps=1))
+    assert (rep.repetition_flags, rep.repetition_corrected) == (1, 1)
+    assert rep.repetition_paid == 1
 
 
 def test_streaks_are_dropped_for_a_pair_no_longer_flagged(pm, ladder, rep_buffer):

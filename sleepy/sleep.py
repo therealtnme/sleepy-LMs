@@ -87,6 +87,15 @@ class SleepConfig:
     reinit_movement: float = 0.25
     # Relative loss the reinit batch may rise by and still be accepted.
     reinit_loss_tol: float = 0.01
+    # Where in the budget the blanking lands, as a fraction of it. At 1.0 it is
+    # the last thing a sleep does and the next sleep is the first to touch the
+    # blanked rows — so the blank is judged only by the loss it costs, never by
+    # what training could make of it. Earlier, every remaining step trains the
+    # new directions, and the blank is judged after them, on the trigger's own
+    # batch: a blank the rest of the window repaid is kept, one it did not is
+    # restored. The readouts are taken at the trigger, since they describe the
+    # steps that led to it.
+    reinit_at: float = 1.0
     # Adaptive Plasticity Control: six learned coefficients set a per-component
     # LR multiplier and a trust gate on the optimizer's proposed update. Off by
     # default — it is the one knob here that can make a step *worse* while it
@@ -118,9 +127,27 @@ class SleepConfig:
     # labelled pairs exists, so it should collect flags before it is trusted to
     # move weights. `repetition_loss_steps` is the streak a pair must reach
     # first: one flag is a candidate, and one sleep is one flag.
+    #
+    # The three switches are separate stages. `guard` runs detection at all;
+    # `train` decides whether its output reaches the loss. Guard on and train
+    # off is the rollout's first stage — every counter reports and no weight
+    # moves.
     repetition_guard: bool = False
+    # Collect flags and corrections without ever touching a weight — stage one
+    # of the detector's rollout, where the scores are still being read off live
+    # data. Off, the streak table and every counter still run and the contrastive
+    # term does not, so the cost of detection is a sleep that trains exactly as
+    # it would have without the detector. Both are off, detection itself stops.
+    repetition_train: bool = True
     repetition_response_threshold: float = 0.85   # `similar` floor a pair must clear
     repetition_max_pairs: int = 8    # pairs considered per sleep; each costs generations
+    repetition_window: int = 8       # exchanges scanned back for the copied answer
+    # Pairs whose serialized prefix fills `seq_len` are dropped before training:
+    # `answer_logprob` has no unmasked answer token left and returns `None`, so
+    # the term would be composed of holes. Filtering here, once, is what lets
+    # `repetition_applied` count what was applied rather than what was offered.
+    # 0 means `seq_len` — nothing but the window itself is too long.
+    repetition_max_len: int = 0
     repetition_loss_steps: int = 2   # consecutive flagged sleeps before the term is paid
     repetition_loss_weight: float = 0.02
     repetition_beta: float = 1.0     # logistic temperature on the likelihood margin
@@ -151,9 +178,12 @@ class SleepReport:
     rejuvenated: int = 0
     # Components blanked by a selective reinitialization, and how many of those
     # the before/after loss check rolled back (0 when off, or when nothing
-    # qualified).
+    # qualified). `reinit_trained` is the steps trained after a mid-window blank
+    # — at 0 the slot ends the sleep exactly as it was blanked, which is what
+    # `reinit_at: 1.0` does every time.
     reinitialized: int = 0
     reinit_reverted: int = 0
+    reinit_trained: int = 0
     # Mean relative displacement of the rank per step; the plasticity readout
     # before it is normalised for storage.
     comp_disp: float = float("nan")
@@ -171,13 +201,27 @@ class SleepReport:
     depth: float = float("nan")
     # Items added to the batch by associative expansion (0 when off).
     assoc: int = 0
-    # Repetition flags seen this sleep, how many cleared the streak and were
-    # paid, and how many of those had a correction at all. The last is the
-    # number that matters for `require_correction`: a flag with nothing to
-    # prefer teaches nothing, so it is counted apart rather than paid.
+    # Repetition counters, six separate questions in a detector whose stages
+    # are deliberately not the same stage. `flags` is detection: every pair
+    # this sleep judged a failure, matured or not. `corrected` is correction: a
+    # matured flag with a verified correction, so it can never exceed `flags`;
+    # the shortfall is `uncorrected` (nothing to prefer), `unverified` (only a
+    # guess nobody vouched for) and flags that have not matured yet.
+    # `applied` is training: pairs whose two sides were both scored, so it can
+    # never exceed `corrected` either — a pair that could not be scored lands in
+    # `skipped` instead, so the gap between `corrected` and `applied` is the
+    # honest cost of the window rather than a silent hole in the mean. `paid` is
+    # the term actually added to the loss, so `paid <= applied`, and it is 0
+    # throughout with `repetition_train` off while every tally above still
+    # reports — which is what makes detection collectable without a weight
+    # moving.
     repetition_flags: int = 0
+    repetition_corrected: int = 0
+    repetition_applied: int = 0
+    repetition_skipped: int = 0
     repetition_paid: int = 0
     repetition_uncorrected: int = 0
+    repetition_unverified: int = 0
     repetition_loss: float = float("nan")
     gate_ok: bool = False
     reason: str = ""
@@ -185,9 +229,11 @@ class SleepReport:
     KEYS = ("slot", "rank", "steps", "truncated", "loss_first", "loss_last",
             "kl_commit", "core_loss", "delta_ratio", "eff_rank", "comp_live",
             "comp_moving", "comp_disp", "rejuvenated", "reinitialized",
-            "reinit_reverted", "adapt_mult", "adapt_gate",
+            "reinit_reverted", "reinit_trained", "adapt_mult", "adapt_gate",
             "adapt_steps", "depth", "assoc", "repetition_flags",
-            "repetition_paid", "repetition_uncorrected", "gate_ok", "reason")
+            "repetition_corrected", "repetition_applied", "repetition_skipped",
+            "repetition_paid", "repetition_uncorrected",
+            "repetition_unverified", "gate_ok", "reason")
 
     def row(self) -> dict:
         return {k: getattr(self, k) for k in self.KEYS}
@@ -202,8 +248,33 @@ def encode(cfg: SleepConfig, text: str) -> dict:
             "labels": labels}
 
 
+def _turns(prompt: str, answer: str, source: str) -> str:
+    """One request/answer pair in the replay serialization, `render`'s format.
+
+    The pair is scored through the same `<|role|>` framing the replay batch is
+    trained through, so the margin is measured in the shape the weights
+    actually see. A plain `prompt + "\n" + answer` would train the pair
+    boundary in one convention and rank it in another.
+
+    The source tag is `render`'s: a `user`-authored answer is untagged, and
+    anything else keeps its tag, so the model can tell a user's correction from
+    a teacher's generation the same way it tells them apart in a batch.
+    """
+    tag = "" if source in ("", "user") else f"[{source}] "
+    return f"<|user|>{prompt}\n<|assistant|>{tag}{answer}"
+
+
+def _provenance(source: str) -> str:
+    """A `Correction.source` narrowed to a tag `render` emits.
+
+    `historical` and `teacher` are both generations and render as `model`;
+    anything already a `Provenance` passes through.
+    """
+    return "model" if source in ("teacher", "historical") else source
+
+
 def answer_logprob(pm, ladder: Ladder, prompt: str, answer: str, cfg: SleepConfig,
-                   slot: Slot) -> torch.Tensor | None:
+                   slot: Slot, source: str = "user") -> torch.Tensor | None:
     """Mean per-token log-likelihood of `answer` given `prompt`, gradient attached.
 
     Teacher-forced, one forward: the prompt is context, only the answer's
@@ -218,13 +289,19 @@ def answer_logprob(pm, ladder: Ladder, prompt: str, answer: str, cfg: SleepConfi
     ladder-wide set back in a `finally`, because a raise here must not leave
     the next step training against a single-slot mask.
     """
-    # Where the answer starts is the prompt's own length, which the padded
+    # Where the answer starts is the assistant header's end, which the padded
     # batch cannot tell us: `encode` pads on the *right*, so the unmasked span
-    # is prompt-plus-answer, not the answer. Encoding the prompt alone gives the
-    # boundary, and truncation by `seq_len` falls out of it — a prompt that
-    # already fills the window leaves nothing to score.
-    start = int(encode(cfg, prompt.rstrip())["attention_mask"][0].sum())
-    batch = encode(cfg, prompt.rstrip() + "\n" + answer.strip())
+    # is the whole exchange. Encoding the request alone gives the boundary, and
+    # truncation by `seq_len` falls out of it — a request that already fills
+    # the window leaves nothing to score.
+    #
+    # The boundary carries the source tag, so only the answer's own tokens are
+    # scored. Leaving the tag out would put it inside the answer's span, and a
+    # `user` side has no tag while a `model` side has one: an untagged
+    # correction would be one tag's worth of tokens longer than the stale
+    # answer it is ranked against.
+    start = int(encode(cfg, _turns(prompt, "", source))["attention_mask"][0].sum())
+    batch = encode(cfg, _turns(prompt, answer.strip(), source))
     batch.pop("labels")
     was_training = pm.training
     try:
@@ -248,25 +325,58 @@ def answer_logprob(pm, ladder: Ladder, prompt: str, answer: str, cfg: SleepConfi
     return picked[keep].mean()
 
 
+def fits(cfg: SleepConfig, prompt: str, answer: str, source: str,
+         limit: int) -> bool:
+    """Whether `answer` still has an unmasked token inside `limit`.
+
+    `answer_logprob` scores from the serialized prefix's end and returns `None`
+    once that end is at `seq_len`, so a pair too long for the window would pay
+    two forwards every step and contribute nothing. This is the same boundary
+    it derives, asked once before the loop instead of once per step per pair.
+    """
+    if not prompt or not answer.strip():
+        return False
+    return int(encode(cfg, _turns(prompt, "", source))["attention_mask"][0].sum()) < limit
+
+
 def contrast(pm, ladder: Ladder, slot: Slot, repeats,
-             cfg: SleepConfig) -> torch.Tensor | None:
-    """The preference term: `-log sigmoid(beta * (logp(correction) - logp(stale)))`.
+             cfg: SleepConfig) -> tuple[torch.Tensor | None, int]:
+    """`(term, skipped)` for the preference term
+    `-log sigmoid(beta * (logp(correction) - logp(stale)))`.
 
     A pairwise ranking rather than a target likelihood, so the model is not told
     *what* to say, only that the correction must be likelier than the answer it
     copied. Averaged over the paid pairs, and `None` when no pair produced a
     usable forward, so a truncated pair cannot silently contribute a zero.
+
+    Both sides go through the replay serialization, and the good side is
+    tagged by provenance: a user correction is `user`, untagged as in a batch,
+    and a teacher's or a history's generation is `model`, which is how a
+    non-user answer is rendered. The stale side is the row's own `source`, in
+    practice `model`. Both sides of a pair must be scored in one convention —
+    the tag changes the prompt, and a margin measured across two conventions
+    would partly measure the tag.
+
+    `skipped` counts the pairs that reached here and could not be scored, by a
+    missing request or a filled window. It is reported apart from the pairs
+    folded into the mean so a shrinking `applied` is visible rather than
+    silently reshaping the average.
     """
     terms = []
+    skipped = 0
     for cand, corr in repeats:
         if not corr.request:
+            skipped += 1
             continue
-        good = answer_logprob(pm, ladder, corr.request, corr.text, cfg, slot)
-        bad = answer_logprob(pm, ladder, corr.request, cand.now.text, cfg, slot)
+        good = answer_logprob(pm, ladder, corr.request, corr.text, cfg, slot,
+                              _provenance(corr.source))
+        bad = answer_logprob(pm, ladder, corr.request, cand.now.text, cfg, slot,
+                             _provenance(cand.now.source))
         if good is None or bad is None:
+            skipped += 1
             continue
         terms.append(torch.nn.functional.softplus(-cfg.repetition_beta * (good - bad)))
-    return torch.stack(terms).mean() if terms else None
+    return (torch.stack(terms).mean() if terms else None), skipped
 
 
 def generate(pm, prompt: str, cfg: SleepConfig) -> str:
@@ -466,19 +576,39 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
     # Every selected item lands exactly once: `expand` is additive and draws
     # from `pool`, which is disjoint from `items`.
 
-    # Repetition detection, then corrections. Neither touches the replay batch
-    # — the correction's own tokens are never among `items` — so this only adds
-    # gradient through the contrastive term below.
+    # Repetition detection, then corrections, then the window check. None
+    # touches the replay batch — the correction's own tokens are never among
+    # `items` — so this only adds gradient through the contrastive term below.
+    # Everything here runs on `repetition_guard`; `repetition_train` is the
+    # later decision of whether the term is paid.
     repeats: list[tuple[repetition.Candidate, repetition.Correction]] = []
-    flags = paid = uncorrected = 0
+    flags = uncorrected = unverified = corrected = 0
     if cfg.repetition_guard:
         ladder.repetition_streaks, repeats, flags = repetition._exchanges(
             buffer.all(), cfg.repetition_response_threshold,
             ladder.repetition_streaks, cfg.repetition_loss_steps,
-            teacher_for(pm, cfg), cfg.repetition_max_pairs)
+            teacher_for(pm, cfg), cfg.repetition_max_pairs,
+            cfg.repetition_window)
+        # A correction is only used where something vouched for it. An
+        # unverified one is a guess at what was wanted, and a base model's
+        # answer to a subject this slot learned may pull against the slot, so
+        # a guess is worse than letting the flag accumulate another sleep.
         uncorrected = sum(1 for _, corr in repeats if corr.text is None)
-        repeats = [(cand, corr) for cand, corr in repeats if corr.text is not None]
-        paid = len(repeats)
+        unverified = sum(1 for _, corr in repeats
+                         if corr.text is not None and not corr.verified)
+        repeats = [(cand, corr) for cand, corr in repeats
+                   if corr.text is not None and corr.verified]
+        corrected = len(repeats)
+        # Too long for the window is knowable without a forward, so it is
+        # settled here rather than once a step inside `contrast`: `applied` then
+        # counts what training was actually offered.
+        limit = cfg.repetition_max_len or cfg.seq_len
+        repeats = [(cand, corr) for cand, corr in repeats
+                   if fits(cfg, corr.request, corr.text, _provenance(corr.source), limit)
+                   and fits(cfg, corr.request, cand.now.text,
+                            _provenance(cand.now.source), limit)]
+    skipped = corrected - len(repeats)
+    applied = paid = 0
 
     # Readout accumulators, keyed by module: a component is (module, rank index),
     # and a fresh slot's factors only exist per module.
@@ -507,6 +637,21 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
     losses: list[float] = []
     step, cursor, truncated = 0, 0, False
     rejuvenated, touched = False, 0
+    # A mid-window reinit blanks at its trigger and is judged after the window:
+    # `saved` is what it blanked (kept so a refusal can still restore it), and
+    # `blank_loss` is the check loss on the trigger step's batch, taken before
+    # the blank and held with the batch itself so the judgement is made on the
+    # same items rather than whatever the window ended on.
+    saved: list[tuple] = []
+    blank_batch: dict | None = None
+    blank_loss: float | None = None
+    blanks = 0
+    trained_after = 0
+    # `mid` is the 1-based step a blank lands at, or `None` for the end-window
+    # path. The readout it consumes describes the steps that led to it, so the
+    # trigger reads importance on its own step; the end path keeps its own probe.
+    mid = components.trigger_step(cfg.reinit_at, cfg.budget_steps) if cfg.reinit else None
+    measured_imp: components.Readout = {}
     # Adaptive control. `imp` stays zero until the halfway probe supplies a
     # measurement.
     ctrl = None
@@ -554,10 +699,21 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
         # the batch and one payment per pass would only multiply its cost. It is
         # scaled by `n_passes` where it is added so the loop's 1/N keeps the
         # configured weight rather than dividing it away.
-        rep_term = (contrast(pm, ladder, slot, repeats, cfg)
-                    if repeats else None)
-        if rep_term is not None:
-            rep_losses.append(float(rep_term.detach()))
+        rep_term = None
+        if repeats and cfg.repetition_train:
+            rep_term, scored_skips = contrast(pm, ladder, slot, repeats, cfg)
+            applied = len(repeats) - scored_skips
+            if rep_term is not None:
+                paid = applied
+                rep_losses.append(float(rep_term.detach()))
+        elif repeats:
+            # Detection without training: the corrections were still gathered
+            # and counted, so the flag and correction tallies say what a paid
+            # sleep would have done, and only the weights are missing.
+            applied = len(repeats)
+        # Derived rather than accumulated: `repeats` is the same list every
+        # step, so adding per-step scraps would count one pair once per step.
+        skipped = corrected - applied
         for pass_i in range(n_passes):
             if span is None:
                 out = pm(**batch)
@@ -643,6 +799,46 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
                     for n, s in components.shares(energy.get("grad")).items()}
             touched += optimizer.rejuvenate(opt, pm, slot.name, mask)
             rejuvenated = True
+        if mid is not None and not saved and step + 1 == mid:
+            # The trigger step. Importance is measured here so it describes the
+            # same span of steps as the displacement already collected, then
+            # the check loss is taken on this step's own batch — the batch the
+            # post-window check is judged against — and the blank happens.
+            # Unsmoothable when there is no history: a reinit-only run's first
+            # window has nothing to smooth against, and this window's own score
+            # is what the check judges.
+            imp_now, was_measured = measured_imp, None
+            if items:
+                got = components.measure(pm, slot.name, batch,
+                                         cfg.component_probes, cfg.component_pairs)
+                if got is not None:
+                    imp_now, was_measured = got
+                    if cfg.components:
+                        imp_now = components.blend(slot.importance, imp_now,
+                                                   cfg.component_alpha)
+                        imp_now = components.eligible(imp_now, slot.measured,
+                                                      was_measured)
+            # Plasticity is read off the accumulator, not `slot.plasticity`: that
+            # is only written after the loop, and is cleared at window start, so
+            # at the trigger it is still `None`. What is in the accumulator is
+            # exactly what this check wants — the displacement of the steps that
+            # led here, the same span the importance above describes.
+            plasticity = (components.quantize_readout(energy["disp"])
+                          if energy.get("disp") else None)
+            stamp = components.stale_mask(imp_now, plasticity, was_measured,
+                                          cfg.reinit_importance, cfg.reinit_movement)
+            if stamp is not None and items:
+                with torch.no_grad():
+                    was_training = pm.training
+                    try:
+                        pm.eval()
+                        blank_loss = float(pm(**batch).loss)
+                    finally:
+                        pm.train(was_training)
+                blank_batch = batch
+                saved = components.reinitialize(pm, slot.name, stamp,
+                                                cfg.budget_steps - mid)
+                blanks = components.count(stamp)
         if (ctrl is not None and items and not imp
                 and step + 1 >= int(cfg.budget_steps * cfg.rejuvenate_at)):
             # One probe for the whole run, at the halfway point alongside the
@@ -656,6 +852,8 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
                 scores, _ = got
                 imp = {n: t.float() / components.MAX for n, t in scores.items()}
         losses.append(batch_loss / n_passes)
+        if saved:
+            trained_after += 1
         step += 1
         if not all(torch.isfinite(torch.tensor(x)) for x in losses[-1:]):
             truncated = True
@@ -699,7 +897,25 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
         # reinit could never fire on the case it exists for.
         slot.plasticity = components.quantize_readout(energy["disp"])
     reinit, reverted = 0, 0
-    if cfg.reinit and scores is not None:
+    if saved:
+        # A mid-window blank is judged here, after the steps it bought: did
+        # training on the new directions repay the loss the blank cost? On the
+        # trigger's own batch, because a batch is only comparable to itself and
+        # the window's last one differs by a whole sample change. A blank that
+        # trained well is kept; one that did not is put back exactly.
+        was_training = pm.training
+        try:
+            with torch.no_grad():
+                pm.eval()
+                after = float(pm(**blank_batch).loss)
+        finally:
+            pm.train(was_training)
+        if _worse(after, blank_loss, cfg.reinit_loss_tol):
+            components.restore(saved)
+            reverted = blanks
+        else:
+            reinit = blanks
+    elif cfg.reinit and scores is not None:
         if slot.importance is None:
             # `components` off says why *report* the readout, not what a reinit
             # may decide on. Unsmoothable: a reinit-only run has no history to
@@ -752,12 +968,15 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
         comp_disp=(components.total(energy.get("disp")) / max(step, 1)
                    if energy.get("disp") else float("nan")),
         rejuvenated=touched, reinitialized=reinit, reinit_reverted=reverted,
+        reinit_trained=trained_after,
         adapt_mult=mult_sum / adapt_steps if adapt_steps else float("nan"),
         adapt_gate=gate_sum / adapt_steps if adapt_steps else float("nan"),
         adapt_steps=adapt_steps,
         depth=depth_sum / step if step else float("nan"), assoc=assoc_added,
-        repetition_flags=flags, repetition_paid=paid,
-        repetition_uncorrected=uncorrected,
+        repetition_flags=flags, repetition_corrected=corrected,
+        repetition_applied=applied, repetition_skipped=skipped,
+        repetition_paid=paid, repetition_uncorrected=uncorrected,
+        repetition_unverified=unverified,
         repetition_loss=(sum(rep_losses) / len(rep_losses)
                          if rep_losses else float("nan")))
 

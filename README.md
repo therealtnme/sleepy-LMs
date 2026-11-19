@@ -28,10 +28,11 @@ Design document plus a working reference implementation. The tests pin the
 invariants the design claims (exact no-op attach, atomic merge rollback, gated
 commits, bounded buffer); the demo exercises the loop end to end on a synthetic
 knowledge stream. Numbers from a 135M CPU run are meaningful in trend, not
-absolute value. Known gaps are listed in DESIGN.md §9.2. One subsystem there is
-prose only: conversational repetition detection (§6.8), which teaches that a
-similar-looking question does not have to get the same answer — designed, not
-built.
+absolute value. Known gaps are listed in DESIGN.md §9.2. Conversational
+repetition detection (§6.8) is implemented but ships off by default: the
+similarity floors are still guesses, so `repetition_guard=True` with
+`repetition_train=False` collects flags on a real transcript before anyone
+trusts it to move weights.
 
 ## Install
 
@@ -138,6 +139,7 @@ python -m sleepy.demo --model HuggingFaceTB/SmolLM2-135M --blocks on   # measure
 | `sleepy/optimizer.py` | selective Adam-moment rejuvenation, mask along the rank axis |
 | `sleepy/probe.py` | throwaway-copy plasticity exam |
 | `sleepy/quiet.py` | learned low-traffic window, with abstention until calibrated |
+| `sleepy/repetition.py` | conversational repetition detection: pair scores, the flag vetoes, and the correction order |
 | `sleepy/orchestrator.py` | schedule, history, and the sleep/handoff/merge loop |
 | `sleepy/demo.py` | synthetic multi-session scenario |
 

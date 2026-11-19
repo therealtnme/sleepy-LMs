@@ -507,6 +507,19 @@ the check refused. A non-finite after-loss counts as a rise and reverts too: the
 rule restores on a *rise*, and NaN is not one, but a broken slot is not a
 successful reinit either.
 
+**The blank can land mid-window instead, and is judged later when it does.**
+`reinit_at` is the fraction of the budget the blank lands at, and its default of
+1.0 is the end-of-window path above. Earlier, the steps that remain train the
+fresh directions before anything is judged, and the judgement then happens after
+the window on the *trigger's* own batch — kept in hand so the two readings are
+comparable — so a blank the rest of the window repaid stands and one it did not
+is restored exactly. The readouts are still taken at the trigger, because they
+describe the steps that led to it rather than the ones that follow. The end of
+the window is right when the question is what the blank costs; a position before
+it is right when the question is what the blank is worth, which is the one that
+matters for training after the sleep. Either way `reinit_trained` reports how
+many steps the new directions got.
+
 The slot's `effective_rank` is recomputed **after** the reinit, not with the
 other post-step readouts. Blanking components shrinks the space the delta spans,
 and that number is persisted and read by `_rank_bound` to decide whether a
@@ -696,10 +709,17 @@ wrong pairing.
 The detector does not pair on the id — it could not, since a response written by
 a live session is not in tier 0 yet when it is scored. `exchange_of` takes the
 run of `user` items directly above an answer, which is the shape
-`buffer.render` writes, and `pairs` walks that and stops at the first item that
-is not a user turn rather than guessing. The id is what lets an eviction keep
-both halves together; pairing still comes from order, and an answer with no
-request above it yields no pair instead of a wrong one. The correction's own
+`buffer.render` writes. Two shapes make "the reply" ambiguous and both are
+settled by order: a `tool` turn is transparent (the model's own errand between
+ask and answer, or after the answer before a correction), and an intermediate
+`assistant` turn — one with no user turn between it and the reply — is a step
+rather than the answer, so `let me check` is not graded as one. A second user
+turn in the run joins the request, because a continuation
+("what is a tensor" / "and how do you reshape one") is part of what the reply had
+to address; judging against only the first would pass a carry-over that ignores
+the continuation. The id is what lets an eviction keep the halves together;
+pairing still comes from order, and an answer with no request above it yields no
+pair instead of a wrong one. The correction's own
 tokens are deliberately not part of `items` — the term is the whole of its
 gradient contribution.
 
@@ -721,14 +741,16 @@ otherwise the slot fits the preference instead of the content. It needs two
 extra forwards per pair (no teacher, no second model at inference), so it is
 capped by a pair count, not run over the whole history. It is a delta like any
 other: the commit gate sees it and a refusal rolls it back with the rest. Staged:
-detection and reporting first (`repetition_guard` off), then correction quality,
+detection and reporting first (`repetition_train` off), then correction quality,
 then the `L` term. Default off until detection is shown to flag real failures on
 real transcripts.
 
-**As implemented (`repetition.py`).** All three stages exist and
-`repetition_guard` turns them on together; the staging above is the rollout
-order, not a set of switches. What shipped differs from the sketch in three
-ways, each because the sketch's shape did not hold against the tests:
+**As implemented (`repetition.py`).** All three stages exist. `repetition_guard`
+turns on detection and correction; `repetition_train` decides whether the `L`
+term is paid, so guard on with train off is the staging above as a real switch —
+every counter still reports, `repetition_paid` stays 0 and no weight moves.
+What shipped differs from the sketch in three ways, each because the sketch's
+shape did not hold against the tests:
 
 * The scores are lexical only. `similar` is a normalized longest-run fraction
   over content words, `gap` compares normalized requests by subject and
@@ -742,13 +764,21 @@ ways, each because the sketch's shape did not hold against the tests:
 * `risk` is *not* the gate. The verbatim copy this subsystem exists for scores
   `gap` 0.8, and so does an asked-for repeat, so no product cutoff separates
   them. `pairs` therefore only measures (`similar >= threshold`), and `flagged`
-  applies two structural vetoes instead: `affirm < 1.0` and a re-ask of the same
-  words to an unchanged model. `risk` is reported and never compared.
-* Correction is by descending trust over the buffer — the user's follow-up, an
-  answer whose own request was about this subject, a stock answer that shares a
-  content word with the fresh one — and only then the teacher. A flag with no
-  correction is counted in `repetition_uncorrected` and skipped, since without
-  a `y_correct` there is no margin to compute.
+  decides on the requests instead: `gap > 0.0` is the flag, because a copy is
+  only a failure where the ask moved, and `affirm < 1.0` removes the asked-for
+  repeat. `risk` is reported and never compared. Judging the request rather
+  than the wording is also what stops the detector punishing a correct answer
+  to a paraphrase ("define X" and "what is X" both alias to `gap` 0.0).
+* Correction is by descending trust — a historical answer whose own request was
+  about this subject (or a stock answer that shares a content word with the
+  fresh one), then a user turn that says it is correcting ("no, it's …"), then
+  a shape-checked teacher, and last a user turn that merely follows. Every
+  branch but the bare follow-up carries its own verification, and only verified
+  text is paid. A flag with no correction is counted in `repetition_uncorrected`
+  and skipped, since without a `y_correct` there is no margin to compute; a
+  guess nobody vouched for is counted in `repetition_unverified` and skipped
+  too, because a base model's answer to a subject the slot learned can pull
+  against the slot.
 
 The `L` term is paid at most once per step, scaled by `n_passes` so the pass
 loop's 1/N does not divide it away, and it enters before the gate so a refusal
@@ -764,11 +794,24 @@ sleep that saw the first one. A pair not re-flagged is dropped rather than
 aged — a pair that stops looking stale should stop being paid at once.
 
 Two costs worth knowing. The answer boundary is the prompt's own encoded
-length, so both halves of a pair have to fit in `seq_len` or the term silently
-goes missing (`repetition_loss` comes back NaN and `repetition_paid` is still
-counted); a live `seq_len` is far above the ~80 tokens a pair needs. And the
-teacher is one generation per uncorrected flag, which is why it is off by
-default even when the guard is on.
+length, so both halves of a pair have to fit in `seq_len` or there is no
+unmasked answer token left to score. Pairs beyond `repetition_max_len` (0 means
+`seq_len`) are filtered once before the loop and counted in
+`repetition_skipped`, and any pair the forward still refuses lands there too, so
+`repetition_applied` is what training was actually handed and the mean is not
+quietly taken over a smaller set than `repetition_corrected` promised. A live
+`seq_len` is far above the ~80 tokens a pair needs. And the teacher is one
+generation per uncorrected flag, which is why it is off by default even when the
+guard is on.
+
+**Counters.** Six, because the stages are not the same stage and one number
+collapses them. `flags` is detection (every pair judged a failure, matured or
+not). `corrected` is correction (a matured flag with a verified target), and the
+shortfall from `flags` is `uncorrected` (nothing better to prefer),
+`unverified` (only a guess), or not yet matured. `applied` is training and never
+exceeds `corrected`; `skipped` is the difference and `paid` is what reached the
+loss, so `paid <= applied <= corrected <= flags`. With `repetition_train` off,
+`paid` is 0 while every other count reports.
 
 ## 7. Replay mix
 
@@ -927,7 +970,10 @@ Resolved, with the evidence that closed each one:
   were dead, so a component whose knowledge the batch never exercises reads both
   unimportant and unmoving and passes the check unchanged. The two opinions are
   not independent. A held-out batch would be the fix and costs a second encode
-  and two forwards per window.
+  and two forwards per window. At `reinit_at < 1.0` the readout is no better,
+  but the judgement is partly independent: the trigger batch's after-loss is
+  taken after the window has trained, and training on the other batches is
+  movement that batch's own reading could not have supplied.
 * **Adaptive depth's "converged" is a proxy.** §6.5 compares a batch's loss
   across steps, which is a loss movement, not a measurement that the batch *is*
   converged; a batch whose loss oscillates reads as converged and loses a pass it
@@ -952,6 +998,14 @@ Resolved, with the evidence that closed each one:
 * **A deployment that logs only user turns cannot feed §6.8.** The detector needs
   `y_old`, the response actually given, and that only exists in tier 0. Nothing
   validates the caller's log shape against that.
+* **§6.8's floors are uncalibrated guesses.** The similarity floor, the gap and
+  `affirm` thresholds, and the `repetition_beta` weight were chosen by hand with
+  no labelled transcript behind them, so the false-positive and false-negative
+  rates of the flag are unknown — a floor too low flags legitimate parallel
+  questions, a floor too high misses the repetition it exists for. That is the
+  whole reason detection ships off and `repetition_train` is a separate switch:
+  the counters can be read against a real transcript before any of these numbers
+  is trusted to move weights.
 * **Only the merge residual is exception-safe, not the process.** The mutate →
   gate window now rolls back in-memory state, but nothing is written to disk: a
   kill -9 between the base write and the gate still loses the commit, because the
@@ -1068,7 +1122,9 @@ importance/displacement readouts feeding the merge prune and the selective
 reinit, diffusion-block training with its matched-step A/B, selective optimizer
 rejuvenation, adaptive plasticity control, adaptive sleep depth, ladder
 save/load, and the full instrumentation table. Conversational repetition
-detection (§6.8) is designed here and not yet built.
+detection (§6.8) is built too: `repetition.py` scores, flags, and proposes
+corrections, and the `L` term is gated separately from detection by
+`repetition_train`. It ships off, and its floors are uncalibrated (see §9.2).
 `python -m sleepy.demo` runs a multi-session scenario with
 a synthetic knowledge stream and prints the signals above so the schedule can be
 watched end to end. Numbers from a 135M CPU run are for *shape* only.

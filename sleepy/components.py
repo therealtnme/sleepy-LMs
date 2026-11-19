@@ -54,25 +54,33 @@ MAX = 255.0
 Readout = dict[str, torch.Tensor]
 
 
-def _stems(pm, adapter: str) -> list[str]:
-    """Module names carrying `adapter`, in a stable order."""
-    return [n for n, mod in adapted_modules(pm) if adapter in mod.lora_B]
-
-
 def component_energy(pm, adapter: str) -> Readout:
     """Per-component output scale `||b_i|| * ||a_i||`, per module.
 
     The free standing-in for importance: it needs no forward pass, so it picks
     the probe set and the probe only has to overturn it where it is wrong.
     """
-    out = {}
+    return _energies(pm, adapter)[0]
+
+
+def _energies(pm, adapter: str) -> tuple[Readout, dict[str, torch.nn.Module]]:
+    """`component_energy`, plus the modules it was taken over.
+
+    The modules come back with the scores because a readout's names are exactly
+    the modules a probe has to zero, and recovering them by name means walking
+    the whole model again — `adapted_modules` is a recursive `named_modules()`
+    and costs more per call than the norms here do.
+    """
+    out: Readout = {}
+    mods: dict[str, torch.nn.Module] = {}
     for name, mod in adapted_modules(pm):
         if adapter not in mod.lora_B:
             continue
         b = mod.lora_B[adapter].weight.detach().float().norm(dim=0)
         a = mod.lora_A[adapter].weight.detach().float().norm(dim=1)
         out[name] = b * a
-    return out
+        mods[name] = mod
+    return out, mods
 
 
 def gradient_contribution(pm, adapter: str) -> Readout | None:
@@ -209,18 +217,25 @@ def shares(contribution: Readout | None) -> Readout:
 
 
 @contextmanager
-def _dropped(pm, adapter: str, comps: dict[str, list[int]]):
+def _dropped(pm, adapter: str, comps: dict[str, list[int]],
+             mods: dict[str, torch.nn.Module] | None = None):
     """Zero the given components of the named modules for the block, then restore.
 
     Both factors go: `b_i` alone would already kill the update, but anything that
     reads `A` (a merge, a rank readout) has to see the removal too.
+
+    `mods` is the map `measure` already holds; without it the model is walked
+    for the modules by name, which is only worth doing for a one-off call.
     """
+    if mods is None:
+        mods = {n: m for n, m in adapted_modules(pm) if adapter in m.lora_B}
     saved = []
     with torch.no_grad():
-        for name, mod in adapted_modules(pm):
-            if adapter not in mod.lora_B or name not in comps:
+        for name, cols_list in comps.items():
+            mod = mods.get(name)
+            if mod is None:
                 continue
-            cols = torch.as_tensor(sorted(set(comps[name])), dtype=torch.long)
+            cols = torch.as_tensor(sorted(set(cols_list)), dtype=torch.long)
             b, a = mod.lora_B[adapter].weight, mod.lora_A[adapter].weight
             saved.append((b, a, cols, b[:, cols].clone(), a[cols, :].clone()))
             b[:, cols] = 0.0
@@ -235,9 +250,9 @@ def _dropped(pm, adapter: str, comps: dict[str, list[int]]):
 
 
 @torch.no_grad()
-def _loss_without(pm, batch: dict, adapter: str,
-                  comps: dict[str, list[int]]) -> float:
-    with _dropped(pm, adapter, comps):
+def _loss_without(pm, batch: dict, adapter: str, comps: dict[str, list[int]],
+                  mods: dict[str, torch.nn.Module] | None = None) -> float:
+    with _dropped(pm, adapter, comps, mods):
         return float(pm(**batch).loss)
 
 
@@ -330,7 +345,7 @@ def measure(pm, adapter: str, batch: dict, cap: int = 8,
     therefore re-probed as pairs, and any synergy `I_ij - I_i - I_j > 0` splits
     between them.
     """
-    energy = component_energy(pm, adapter)
+    energy, mods = _energies(pm, adapter)
     if not energy:
         return None
     was_training = pm.training
@@ -343,7 +358,7 @@ def measure(pm, adapter: str, batch: dict, cap: int = 8,
             probe = torch.topk(e, max(1, min(cap, rank))).indices.tolist()
             raw = torch.zeros(rank)
             for i in probe:
-                raw[i] = max(0.0, _loss_without(pm, batch, adapter, {name: [i]}) - full)
+                raw[i] = max(0.0, _loss_without(pm, batch, adapter, {name: [i]}, mods) - full)
 
             low = sorted(probe, key=lambda i: (float(raw[i]), i))
             taken = 0
@@ -352,7 +367,7 @@ def measure(pm, adapter: str, batch: dict, cap: int = 8,
                     if taken >= pairs:
                         break
                     i, j = low[x], low[y]
-                    synergy = (_loss_without(pm, batch, adapter, {name: [i, j]})
+                    synergy = (_loss_without(pm, batch, adapter, {name: [i, j]}, mods)
                                - full - raw[i] - raw[j])
                     if synergy > 0:
                         raw[i] += synergy / 2

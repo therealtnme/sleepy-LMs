@@ -1022,6 +1022,14 @@ Resolved, with the evidence that closed each one:
   text included, and ran millions of times. Removal keeps pool order rather
   than swapping with the tail, because `all()[:k]` reads it. Same 50k replay:
   1.9 s.
+* **`measure` walks the model once, not once per probe.** Each probe has to
+  zero a component and put it back, and it found the module to zero by name by
+  re-running `adapted_modules` — a recursive `named_modules()` that costs
+  ~0.5 ms and ran 45 times per `measure` at rank 16. The map of adapted modules
+  now comes out of the energy pass, which already had them, so a call walks once
+  and holds the map across every probe: 509 → 441 ms at rank 16, with the rest
+  the forwards leave-one-out actually needs. The pure `component_energy` is a
+  thin wrapper, since the walk is only redundant when repeated.
 * **A group is written under one lock and one open.** The lock is ~0.53 ms and
   the rest of an append is ~0.15 ms, so writing a two-turn exchange row by row
   paid it twice for nothing; one write also keeps the rows contiguous, so a

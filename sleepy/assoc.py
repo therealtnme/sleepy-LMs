@@ -32,16 +32,30 @@ def _words(text: str) -> list[str]:
     return _WORD.findall(text.lower())
 
 
+# Gram -> bucket, kept across calls. The vocabulary a replay batch covers is
+# small and highly repetitive (the same few dozen words reach most texts), so
+# hashing is re-paid for a bucket already known. Unbounded rather than bounded:
+# it only ever holds grams an indexed text contained, and one sleep's worth of
+# those is a few thousand.
+_bucket_cache: dict[str, int] = {}
+
+
+def _bucket(gram: str) -> int:
+    b = _bucket_cache.get(gram)
+    if b is None:
+        b = int.from_bytes(hashlib.blake2b(gram.encode(), digest_size=8).digest(), "big") % BUCKETS
+        _bucket_cache[gram] = b
+    return b
+
+
 def features(text: str) -> dict[int, float]:
     """Hashed unigram+bigram vector, unit length, or empty for a bag of words."""
     words = _words(text)
     if not words:
         return {}
-    grams = words + [f"{a} {b}" for a, b in zip(words, words[1:], strict=False)]
     counts: dict[int, float] = {}
-    for g in grams:
-        h = int.from_bytes(hashlib.blake2b(g.encode(), digest_size=8).digest(), "big")
-        b = h % BUCKETS
+    for g in words + [f"{a} {b}" for a, b in zip(words, words[1:], strict=False)]:
+        b = _bucket(g)
         counts[b] = counts.get(b, 0.0) + 1.0
     norm = sum(v * v for v in counts.values()) ** 0.5
     return {b: v / norm for b, v in counts.items()}
@@ -65,9 +79,13 @@ class Index:
             vec = features(it.text)
             if not vec:
                 continue
-            self.vectors[it.key()] = vec
-            for b in vec:
-                self.postings.setdefault(b, []).append(it.key())
+            key = it.key()
+            self.vectors[key] = vec
+            # The weight rides in the posting so a query can accumulate the dot
+            # product in one pass over its own buckets, instead of looking the
+            # other document's vector up once per candidate.
+            for b, w in vec.items():
+                self.postings.setdefault(b, []).append((key, w))
         return self
 
     def similarity(self, a: tuple, b: tuple) -> float:
@@ -86,12 +104,18 @@ class Index:
         vec = self.vectors.get(key)
         if not vec or k <= 0:
             return []
-        hit: set[tuple] = set()
-        for b in vec:
-            hit.update(self.postings.get(b, ()))
-        scored = [(self.similarity(key, other), other) for other in hit
-                  if other != key and other not in exclude]
-        scored = [(s, o) for s, o in scored if s >= min_sim]
+        # Accumulate the dot product straight from the postings. Both vectors
+        # are unit length, so the running sum is the cosine — and a bucket with
+        # no posting contributes nothing, which is why the union-of-postings
+        # shortcut still holds. Scoring out of a dict is also faster than a
+        # `similarity()` call per candidate here: that one re-derefs the other
+        # document's vector from its key for every bucket they share.
+        scores: dict[tuple, float] = {}
+        for b, wa in vec.items():
+            for other, wb in self.postings.get(b, ()):
+                scores[other] = scores.get(other, 0.0) + wa * wb
+        scored = [(s, o) for o, s in scores.items()
+                  if s >= min_sim and o != key and o not in exclude]
         scored.sort(key=lambda p: (-p[0], p[1]))
         return [o for _, o in scored[:k]]
 

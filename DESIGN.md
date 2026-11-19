@@ -1011,6 +1011,24 @@ Resolved, with the evidence that closed each one:
 * The test tokenizer was non-deterministic, so a loss measured before a step was
   not comparable to one measured after it; it now hashes the text into a seeded
   generator.
+* **The pool is indexed, so a reload is linear in the log.** Every append asks
+  the pool three questions — which copies a re-sent turn supersedes, how wide a
+  victim's exchange is, where a victim sits — and answering each by scanning
+  made `_load` quadratic: a 50k-row replay took 51 s. `_pool` (key →
+  admission sequence and item) answers the first two, since a key is unique in
+  the pool and its exchange membership is a set on `_groups`; a parallel
+  `_seqs` list bisected for the sequence answers the third, so removal is a
+  `del` and never invokes the dataclass `__eq__` — it compares every field,
+  text included, and ran millions of times. Removal keeps pool order rather
+  than swapping with the tail, because `all()[:k]` reads it. Same 50k replay:
+  1.9 s.
+* **A group is written under one lock and one open.** The lock is ~0.53 ms and
+  the rest of an append is ~0.15 ms, so writing a two-turn exchange row by row
+  paid it twice for nothing; one write also keeps the rows contiguous, so a
+  competing reader cannot see half a group. The rows are banked at
+  `self._seen + n` off a single base, as before. The `fcntl` probe was also
+  hoisted to module scope — a failed `import` inside the lock cost 2 ms per
+  call on Windows, four times the `locking` it preceded.
 
 * **No `try`/`finally` across the mutate → gate window** (closed 2026-11-16).
   An exception in the inner distillation loop (OOM, non-finite backward) used to

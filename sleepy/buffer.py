@@ -27,10 +27,17 @@ import contextlib
 import json
 import random
 import time
+from bisect import bisect_left
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Literal
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+    import msvcrt
 
 Provenance = Literal["user", "tool", "model", "system"]
 
@@ -72,6 +79,22 @@ class Buffer:
         self.capacity = capacity
         self._rng = random.Random(seed)
         self._items: list[Item] = []
+        # Indexes over `_items`, because eviction asks three questions of the
+        # pool per append — which copies a re-sent turn supersedes, how wide a
+        # victim's exchange is, and where a victim sits — and answering any by
+        # scanning made a replay of the log quadratic in its length.
+        #
+        # `_pool` is key -> (admission sequence, item), so it answers the first
+        # two (a key is unique in the pool, so presence is membership) and gives
+        # `_drop` the sequence that answers the third. `_seqs` is those
+        # sequences in admission order, parallel to `_items`, and `_drop`
+        # bisects it: `_items` is never searched, so removal costs no item
+        # comparisons at all — a dataclass `__eq__` compares every field, the
+        # text included, and `list.remove` ran millions of them on a reload.
+        self._pool: dict[tuple, tuple[int, Item]] = {}
+        self._seqs: list[int] = []
+        self._seq = 0
+        self._groups: dict[str, set[tuple]] = {}
         self._core: list[Item] = []
         self._seen = 0
         # Append count, never decremented by eviction. `len()` pins at capacity,
@@ -171,9 +194,9 @@ class Buffer:
             self.added += len(pool)
             if pool:
                 self._reserve(pool)
-            banked = {it.key() for it in group if it.is_core}
-            if banked:
-                self._items = [it for it in self._items if it.key() not in banked]
+            for it in group:
+                if it.is_core and it.key() in self._pool:
+                    self._drop(self._pool[it.key()][1])
 
     @property
     def _lock_path(self) -> Path:
@@ -191,14 +214,13 @@ class Buffer:
         appends it is meant to serialise.
         """
         with self._lock_path.open("a+b") as fh:
-            try:
-                import fcntl
-            except ImportError:  # Windows
-                import msvcrt
-
-                fh.seek(0)
+            if fcntl is None:
                 while True:
                     try:
+                        # The handle is opened in append mode, but `locking`
+                        # takes a byte range from the current position, so the
+                        # seek is what pins it to byte 0 for every taker.
+                        fh.seek(0)
                         msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
                         break
                     except OSError:  # LK_LOCK gives up after ~10s; take it again
@@ -215,18 +237,31 @@ class Buffer:
                 finally:
                     fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
-    def _append(self, item: Item) -> None:
-        rec = asdict(item)
-        # Banked so a replay can draw under this item's own index instead of
-        # re-counting the log, which would put a replayed write at the tail and
-        # pick a different victim than the live path did.
-        rec["seen"] = self._seen
-        rec.pop("importance")
-        rec.pop("unfit")
-        line = json.dumps(rec, ensure_ascii=False) + "\n"
+    def _append(self, items: list[Item]) -> None:
+        """Write a whole group under one lock and one open.
+
+        Both are paid per call, so a two-turn group written row by row pays the
+        lock twice — and the lock is the expensive part of an append by a wide
+        margin. One write for the group also keeps its rows contiguous, so a
+        reader can never see half of it under a competing lock.
+
+        Row `n` is banked at `self._seen + n`, the index the live path drew
+        against for that row, so a replay can draw under each item's own index
+        instead of re-counting the log — which would put a replayed write at the
+        tail and pick a different victim than the live path did.
+        """
+        base = self._seen
+        out = []
+        for n, it in enumerate(items):
+            rec = asdict(it)
+            rec["seen"] = base + n
+            rec.pop("importance")
+            rec.pop("unfit")
+            out.append(json.dumps(rec, ensure_ascii=False))
+        body = "\n".join(out) + "\n"
         with self._locked():
             with self.path.open("a", encoding="utf-8") as fh:
-                fh.write(line)
+                fh.write(body)
 
     # -- writes ------------------------------------------------------------
     def add(self, item: Item, core: bool = False) -> None:
@@ -236,7 +271,7 @@ class Buffer:
         writers go through `add_turns`, which keeps an exchange to one draw.
         """
         item.is_core = core
-        self._append(item)
+        self._append([item])
         if core:
             self._core.append(item)
             return
@@ -276,12 +311,14 @@ class Buffer:
         # key. The old copy has to go or the pool would train the turn twice —
         # and eviction no longer overwrites it, because a group victim is
         # removed by exchange, not by slot.
-        keys = {it.key() for it in items}
-        self._items = [it for it in self._items if it.key() not in keys]
+        for it in items:
+            stale = self._pool.get(it.key())
+            if stale is not None:
+                self._drop(stale[1])
         # Its width fits in one slot. Short of a full pool it simply fills,
         # which is what the shortfall was for.
         if len(self._items) + len(items) <= self.capacity:
-            self._items.extend(items)
+            self._admit(items)
             return
         # The group joining a full pool is always drawn against, else it could
         # never be kept and a perfectly good group would be lost every append.
@@ -289,21 +326,56 @@ class Buffer:
         # frees one record — so it cannot fit whole without breaching capacity,
         # nor may it sit out now that it has been drawn against.
         j = self._rng.randrange(self._seen)
-        j, room = self._room(self._items, j)
+        j, room = self._room(j)
         victim = self._items[j]
         if victim.exchange:
-            self._items = [it for it in self._items if it.exchange != victim.exchange]
+            # `_drop` mutates the set, so walk a frozen copy of the members.
+            for key in set(self._groups.get(victim.exchange, ())):
+                member = self._pool.get(key)
+                if member is not None:
+                    self._drop(member[1], key)
         else:
-            del self._items[j]
+            self._drop(victim)
         take = min(len(items), room)
         if take < len(items):
             for it in items:
                 it.unfit = True
             items = items[:take]
+        self._admit(items)
+
+    def _admit(self, items: list[Item]) -> None:
+        """Put a group in the pool and index it."""
+        for it in items:
+            key = it.key()
+            self._seq += 1
+            self._seqs.append(self._seq)
+            self._pool[key] = (self._seq, it)
+            if it.exchange:
+                self._groups.setdefault(it.exchange, set()).add(key)
         self._items.extend(items)
 
-    @staticmethod
-    def _room(items: list[Item], j: int) -> tuple[int, int]:
+    def _drop(self, it: Item, key: tuple | None = None) -> None:
+        """Take one item out of the pool and its index, keeping pool order.
+
+        `key` is passed when the caller already has it. Keys are unique in the
+        pool (a re-sent key is dropped before its copy is admitted), so the
+        entry under a key is the only item equal to it. The position comes from
+        bisecting `_seqs`; removal by `del`, not a swap with the tail, because
+        `all()[:k]` reads pool order.
+        """
+        key = it.key() if key is None else key
+        seq = self._pool[key][0]
+        del self._pool[key]
+        i = bisect_left(self._seqs, seq)
+        del self._items[i]
+        del self._seqs[i]
+        if it.exchange:
+            members = self._groups[it.exchange]
+            members.discard(key)
+            if not members:
+                del self._groups[it.exchange]
+
+    def _room(self, j: int) -> tuple[int, int]:
         """Slots a victim at index `j` frees, and the index to remove there.
 
         A group victim takes its whole exchange; a lone one takes itself, so the
@@ -311,9 +383,10 @@ class Buffer:
         which leaves no lone item to refill it, so the index is clamped — and
         the clamped index is what gets removed.
         """
-        j = min(j, len(items) - 1)
-        room = sum(1 for it in items if items[j].exchange and it.exchange == items[j].exchange)
-        return j, room or 1
+        j = min(j, len(self._items) - 1)
+        exchange = self._items[j].exchange
+        room = len(self._groups[exchange]) if exchange else 1
+        return j, room
 
     def add_turns(self, session: int, turns: Iterable[tuple[str, str, Provenance]],
                   ts: float | None = None) -> None:
@@ -353,11 +426,8 @@ class Buffer:
 
     def _flush(self, group: list[Item]) -> None:
         """Write a finished group and admit it on one draw."""
-        start = self._seen
-        for n, it in enumerate(group):
-            self._seen = start + n
-            self._append(it)
-        self._seen = start + len(group)
+        self._append(group)
+        self._seen += len(group)
         self.added += len(group)
         self._reserve(group)
 
@@ -373,8 +443,10 @@ class Buffer:
         core copy to the log, and `_load` would then hold it twice in `_core`.
         """
         items = list(items)
-        keys = {it.key() for it in items}
-        self._items = [it for it in self._items if it.key() not in keys]
+        for it in items:
+            stale = self._pool.get(it.key())
+            if stale is not None:
+                self._drop(stale[1])
         banked = {it.key() for it in self._core}
         for it in items:
             if it.key() not in banked:

@@ -151,6 +151,11 @@ def test_pairs_stop_at_an_exchange_without_an_answer():
     assert repetition.pairs(items, 0.5) == []
 
 
+def test_a_pair_budget_of_zero_keeps_nothing():
+    assert repetition.pairs(transcript(), 0.5, 0) == []
+    assert len(repetition.pairs(transcript(), 0.5, 1)) == 1
+
+
 # -- exchange shape ------------------------------------------------------
 def test_a_tool_result_between_ask_and_answer_is_transparent():
     # `user, assistant, tool, assistant` is one exchange: the first answer is a
@@ -174,6 +179,45 @@ def test_a_tool_turn_does_not_rename_the_request():
     # request text the gap is judged against.
     items = [item(0, "user", "what is a tensor"),
              item(1, "tool", "shape, dtype, device, strides"),
+             item(2, "assistant", "an array of numbers")]
+    pair, = repetition.exchanges(items)
+    assert pair[0].text == "what is a tensor"
+
+
+def test_a_system_turn_is_transparent_in_both_directions():
+    # A prompt injected mid-conversation is configuration, not an ask and not an
+    # answer, so it must neither sever the exchange below it nor end the walk
+    # above one.
+    items = [item(0, "user", "what is a tensor"),
+             item(1, "system", "be terse"),
+             item(2, "assistant", "an array of numbers"),
+             item(3, "system", "cite your sources"),
+             item(4, "user", "why does gradient descent work"),
+             item(5, "assistant", "an array of numbers")]
+    assert [(r.text, a.turn) for r, a in repetition.exchanges(items)] == [
+        ("what is a tensor", 2), ("why does gradient descent work", 5)]
+    assert [c.now.turn for c in repetition.flagged(items, 0.5)] == [5]
+
+
+def test_a_blank_user_turn_does_not_become_the_request():
+    # Assistant prefill writes a blank user turn. Left alone it has no subject,
+    # so `gap` scores it 0.8 against everything and the copy is flagged every
+    # sleep — including behind `fits()`, which drops an empty prompt, so the
+    # flag never clears. The real ask underneath is the request.
+    items = [item(0, "user", "what is a tensor"),
+             item(1, "assistant", "an array of numbers"),
+             item(2, "user", ""),
+             item(3, "assistant", "an array of numbers")]
+    pair, = repetition.exchanges(items)[1:]
+    assert pair[0].text == "what is a tensor"
+    # Same ask either side of the blank, so the copy is correct and unflaggged.
+    assert repetition.pairs(items, 0.5)[0].gap == 0.0
+    assert repetition.flagged(items, 0.5) == []
+
+
+def test_a_blank_turn_does_not_join_into_the_request():
+    items = [item(0, "user", "what is a tensor"),
+             item(1, "user", ""),
              item(2, "assistant", "an array of numbers")]
     pair, = repetition.exchanges(items)
     assert pair[0].text == "what is a tensor"

@@ -412,7 +412,10 @@ def exchange_of(items: list[Item], index: int) -> tuple[Item | None, Item | None
     tool, assistant` is one exchange answered by the last assistant, and a tool
     above the ask does not open a new one. An assistant turn with another
     assistant after it is therefore intermediate, not the reply — which is what
-    keeps "let me check" from being graded as the answer.
+    keeps "let me check" from being graded as the answer. A `system` turn is
+    transparent in the same way: it is configuration and never an ask or an
+    answer, so a prompt injected mid-conversation does not sever the exchange it
+    landed in.
 
     The request is the user turns in the run above, joined: a second user turn
     continues the ask ("what is a tensor" / "and how do you reshape one"), so
@@ -432,23 +435,30 @@ def exchange_of(items: list[Item], index: int) -> tuple[Item | None, Item | None
     if now.role != "assistant":
         return None, None
     for it in items[index + 1:]:
-        if it.role == "tool":
+        if it.role in ("tool", "system"):
             continue
         if it.role == "assistant":
             return None, None
         break
+    # A blank user turn is client padding (assistant prefill writes one), so it
+    # is transparent in every direction. As the request it has no subject at
+    # all, so `gap` scores it 0.8 against everything — the unmatched-subject
+    # answer — and the copy is flagged every sleep even though `fits()` drops an
+    # empty prompt, so it can never be paid and the flag never clears. As a
+    # boundary it would cut the exchange off from the ask it belongs to.
     lo = index
     crossed = False
     while lo > 0:
-        role = items[lo - 1].role
-        if role == "user":
+        prev = items[lo - 1]
+        role = prev.role
+        if role == "user" and prev.text.strip():
             crossed = True
         elif role == "assistant" and crossed:
             break
-        elif role not in ("user", "tool", "assistant"):
+        elif role not in ("user", "tool", "assistant", "system"):
             break
         lo -= 1
-    asks = [it for it in items[lo:index] if it.role == "user"]
+    asks = [it for it in items[lo:index] if it.role == "user" and it.text.strip()]
     if not asks:
         return None, None
     if len(asks) == 1:
@@ -474,7 +484,9 @@ def pairs(items: list[Item], risk_min: float, max_pairs: int = 64,
 
     Swept newest-first over the bounded exchange list and stopped at
     `max_pairs`, so the cost is a constant in the buffer's size — a large
-    history must not turn one sleep into a quadratic scan.
+    history must not turn one sleep into a quadratic scan. The stop is checked
+    before a candidate is kept as well as after, so `max_pairs=0` means none
+    rather than the one the loop had already found when it looked.
 
     Each candidate is scored against the `window` exchanges before it and
     keeps the most similar, not only the one immediately before. Adjacent-only
@@ -496,6 +508,8 @@ def pairs(items: list[Item], risk_min: float, max_pairs: int = 64,
     ex = exchanges(items)
     out: list[Candidate] = []
     for i in range(len(ex) - 1, 0, -1):
+        if len(out) >= max_pairs:
+            break
         now_req, now_res = ex[i]
         best = None
         for j in range(i - 1, max(-1, i - 1 - window), -1):

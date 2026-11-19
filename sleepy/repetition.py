@@ -171,19 +171,46 @@ def _words(text: str) -> list[str]:
 
 
 def _ngrams(words: list[str]) -> Counter:
-    grams = list(words) + [f"{a} {b}" for a, b in zip(words, words[1:], strict=False)]
-    return Counter(grams)
+    """Unigrams plus adjacent bigrams as a bag.
+
+    Bigrams are `(a, b)` tuples, not joined strings: `Counter.update` fills a
+    pre-seeded counter straight from an iterator, and a tuple costs less to
+    build than formatting a string per pair.
+    """
+    grams: Counter = Counter(words)
+    grams.update(zip(words, words[1:], strict=False))
+    return grams
 
 
 def _longest_run(a: list[str], b: list[str]) -> int:
-    """Length of the longest run of words appearing in both, in order."""
-    best, prev = 0, [0] * (len(b) + 1)
+    """Length of the longest run of words appearing in both, in order.
+
+    The recurrence is the usual one — `cur[j] = prev[j - 1] + 1` on a word match
+    — but it is walked over the *matches* instead of the full cross product. A
+    word's positions in `b` are looked up once, so the inner loop only visits
+    coordinates that can extend a run: on ordinary prose most pairs of words
+    differ and the dense grid spent nearly all its time on them.
+
+    `prev` holds only the coordinates one step back, and a word absent from `b`
+    clears it, exactly as a row of zeros would — a match three words apart is
+    not a run.
+    """
+    best = 0
+    at: dict[str, list[int]] = {}
+    for j, wb in enumerate(b):
+        at.setdefault(wb, []).append(j)
+    prev: dict[int, int] = {}
     for wa in a:
-        cur = [0] * (len(b) + 1)
-        for j, wb in enumerate(b, start=1):
-            if wa == wb:
-                cur[j] = prev[j - 1] + 1
-                best = max(best, cur[j])
+        js = at.get(wa)
+        if not js:
+            prev = {}
+            continue
+        cur: dict[int, int] = {}
+        for j in js:
+            n = prev.get(j - 1, 0) + 1
+            cur[j] = n
+            if n > best:
+                best = n
         prev = cur
     return best
 
@@ -214,11 +241,16 @@ def response_similarity(a: str, b: str) -> float:
     if not shared:
         return 0.0
     cos = _cosine(_ngrams(wa), _ngrams(wb))
+    # Dice only applies to a run and is never above the share, so a `cos` that
+    # already clears the share settles the max without looking for one — which
+    # is most pairs over ordinary replay, and why the walk is skipped there.
+    shorter = min(len(wa), len(wb))
+    share = shared / shorter
+    if cos >= share:
+        return cos
     if _longest_run(wa, wb) == shared:
-        dice = 2.0 * shared / (len(wa) + len(wb))
-    else:
-        dice = shared / min(len(wa), len(wb))
-    return max(cos, dice)
+        return max(cos, 2.0 * shared / (len(wa) + len(wb)))
+    return share
 
 
 def _cosine(ca: Counter, cb: Counter) -> float:

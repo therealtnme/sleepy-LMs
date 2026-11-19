@@ -764,15 +764,19 @@ def _user_correction(items: list[Item], i: int, request: str) -> Correction:
     the correction ("no, ...", "it's more like ..."); otherwise it is a guess.
 
     A `tool` turn is transparent here too: an errand the model ran after the
-    answer does not end the turn that answers it. Only a non-tool, non-user
-    turn does, so the walk stops at the first real boundary rather than at the
-    first tool result.
+    answer does not end the turn that answers it. So is a blank user turn:
+    `_correction_shaped` and `_explicit` are both false of "", so taking one as
+    the candidate would fail the walk outright, while skipping it reaches the
+    real reply underneath. Only a non-tool, non-user turn, or a user turn with
+    something in it, does stop the walk.
     """
     for nxt in items[i + 1:]:
         if nxt.role == "tool":
             continue
         if nxt.role != "user":
             break
+        if not nxt.text.strip():
+            continue
         if _correction_shaped(nxt.text):
             return Correction(nxt.text, "user", request, verified=_explicit(nxt.text))
         break

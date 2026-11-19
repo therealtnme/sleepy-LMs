@@ -607,8 +607,13 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
                    if fits(cfg, corr.request, corr.text, _provenance(corr.source), limit)
                    and fits(cfg, corr.request, cand.now.text,
                             _provenance(cand.now.source), limit)]
-    skipped = corrected - len(repeats)
     applied = paid = 0
+    # Derived from the same identity as the in-loop line, seeded for the case
+    # the loop never runs: at `budget_steps == 0` nothing is applied, so every
+    # corrected pair is a skip. Seeding from `len(repeats)` instead would leave
+    # `skipped = 0` under a nonzero `corrected` — the one pair a zero budget
+    # silently drops from the tally.
+    skipped = corrected - applied
 
     # Readout accumulators, keyed by module: a component is (module, rank index),
     # and a fresh slot's factors only exist per module.

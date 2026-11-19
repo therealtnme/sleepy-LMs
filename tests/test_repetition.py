@@ -253,6 +253,21 @@ def test_a_tool_result_between_answer_and_correction_does_not_lose_it():
     assert (got.source, got.verified) == ("user", True)
 
 
+def test_a_blank_user_turn_between_answer_and_correction_does_not_lose_it():
+    # Assistant prefill writes a blank user row. Neither shape test can be true
+    # of "", so taking it as the candidate would return no correction at all;
+    # skipping it reaches the real reply underneath.
+    items = [item(0, "user", "how does gradient descent adjust the weights"),
+             item(1, "assistant", "it nudges the weights along the negative gradient"),
+             item(2, "user", "why does gradient descent work"),
+             item(3, "assistant", "it nudges the weights along the negative gradient"),
+             item(4, "user", ""),
+             item(5, "user", "it's because the loss falls fastest downhill")]
+    got = repetition.correct(repetition.flagged(items, 0.5)[0], items)
+    assert (got.text, got.source, got.verified) == (
+        "it's because the loss falls fastest downhill", "user", True)
+
+
 def test_a_tool_copy_is_still_caught_across_the_run():
     # A, B, A with a tool inside B's exchange: the back walk crosses the tool
     # and B's answer, and judges the copy against the ask it was written for.
@@ -458,6 +473,20 @@ def test_an_unverified_correction_is_not_paid(pm, ladder, rep_buffer):
                     cfg_for(pm, repetition_guard=True, repetition_loss_steps=1))
     assert rep.repetition_flags == 1
     assert (rep.repetition_paid, rep.repetition_unverified) == (0, 1)
+
+
+def test_a_zero_budget_reports_every_corrected_pair_as_skipped(pm, ladder, rep_buffer):
+    # The loop never runs, so nothing can be applied. Seeding `skipped` from the
+    # post-`fits` list left it 0 under a nonzero `corrected`, which is the one
+    # pair a zero budget silently dropped from the tally. `cfg_for` pins
+    # `budget_steps` in its own call, so it is overwritten after.
+    cfg = cfg_for(pm, repetition_guard=True, repetition_loss_steps=1,
+                  repetition_train=True)
+    cfg.budget_steps = 0
+    rep = sleep.run(pm, ladder, rep_buffer, ladder.slots[0], cfg)
+    assert (rep.repetition_flags, rep.repetition_corrected) == (1, 1)
+    assert (rep.repetition_applied, rep.repetition_skipped) == (0, 1)
+    assert rep.repetition_paid == 0
 
 
 def test_a_flag_with_no_correction_is_counted_apart(pm, ladder):

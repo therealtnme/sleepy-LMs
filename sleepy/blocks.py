@@ -56,6 +56,9 @@ class BlockConfig:
     gate_core_tol: float = 0.03
     min_memory_gain: float = 0.25   # a split must buy at least 25% peak activation
     max_quality_loss: float = 0.02   # ...without costing more than 2% end-to-end loss
+    # Seeds the sigma draw *and* the corruption noise, so the same seed and step
+    # count replay a run exactly. Both arms of an A/B are trained from clones of
+    # one state with this seed, which is what makes "matched steps" honest.
     seed: int = 0
 
 
@@ -134,6 +137,27 @@ def sigma_span(i: int, n: int, lo: float, hi: float) -> tuple[float, float]:
     return edges[i + 1], edges[i]
 
 
+def noise_like(x: torch.Tensor, seed: int | None, step: int, span: int) -> torch.Tensor:
+    """`randn` shaped and typed like `x`, on `x`'s device.
+
+    Two separate defects meet here. The obvious one: `torch.randn(x.shape)` on
+    its own is a CPU float32 tensor, and adding it to a CUDA or fp16 state
+    raises. The quieter one: unseeded noise makes "matched step count" only
+    half a comparison — the sigmas were seeded but each arm got different
+    draws, so a loss difference between arms was partly luck.
+
+    The seed is keyed by `(seed, step, span)` rather than advanced through a
+    shared generator, so call order cannot shift it: a step's noise is the same
+    whichever block it happens to run in, in either arm, and no state has to
+    be threaded through `_run_variant`. `seed=None` leaves it unseeded, which
+    is the same draw-from-the-global-RNG the callers had before.
+    """
+    if seed is None:
+        return torch.randn(x.shape, device=x.device, dtype=x.dtype)
+    gen = torch.Generator(device=x.device).manual_seed(seed * 1_000_003 + step * 1_009 + span)
+    return torch.randn(x.shape, generator=gen, device=x.device, dtype=x.dtype)
+
+
 def plan(n_layers: int, cfg: BlockConfig, steps: int) -> list[tuple[int, int, float]]:
     """Per-step `(lo, hi, sigma)`: blocks round-robin, each inside its own band.
 
@@ -196,13 +220,16 @@ def forward_full(pm, b: dict) -> torch.Tensor:
     return _loss(chain.logits(chain.run(chain.layers, chain.emb, 0)), labels)
 
 
-def block_logits(pm, b: dict, lo: int, hi: int, sigma: float) -> tuple[torch.Tensor, torch.Tensor]:
+def block_logits(pm, b: dict, lo: int, hi: int, sigma: float,
+                 seed: int | None = None, step: int = 0,
+                 ) -> tuple[torch.Tensor, torch.Tensor]:
     """`forward_block`, but returning `(logits, labels)` so a caller can gate on KL.
 
     The prefix runs under `no_grad`, so no activation above `lo` is retained and
     no gradient crosses the boundary. Noise is scaled by the clean state's own
     RMS, which is the only normalisation that works when the scale varies layer
-    to layer.
+    to layer. The noise itself comes from `noise_like`, on `x`'s own device and
+    dtype and keyed by `(seed, step, lo)` where a seed is given.
     """
     chain, _, labels = _batch(pm, b)
     with torch.no_grad():
@@ -211,13 +238,14 @@ def block_logits(pm, b: dict, lo: int, hi: int, sigma: float) -> tuple[torch.Ten
         else:
             x = chain.emb.detach()
         scale = x.pow(2).mean().sqrt().clamp_min(1e-6)
-        x = x + sigma * scale * torch.randn(x.shape, generator=None)
+        x = x + sigma * scale * noise_like(x, seed, step, lo)
     return chain.logits(chain.run(chain.layers[lo:hi], x, lo)), labels
 
 
-def forward_block(pm, b: dict, lo: int, hi: int, sigma: float) -> torch.Tensor:
+def forward_block(pm, b: dict, lo: int, hi: int, sigma: float,
+                  seed: int | None = None, step: int = 0) -> torch.Tensor:
     """Local denoising loss: corrupt the boundary state, one block predicts the clean one."""
-    logits, labels = block_logits(pm, b, lo, hi, sigma)
+    logits, labels = block_logits(pm, b, lo, hi, sigma, seed, step)
     return _loss(logits, labels)
 
 
@@ -320,7 +348,10 @@ def _run_variant(pm, batches: list[dict], cfg: BlockConfig,
     losses: list[float] = []
     for step, (lo, hi, sigma) in enumerate(plan):
         b = batches[step % len(batches)]
-        loss = forward_block(pm, b, lo, hi, sigma) if block else forward_full(pm, b)
+        # Same seed for both arms and the step index keeps block noise
+        # replayable; the e2e arm never reads it.
+        loss = (forward_block(pm, b, lo, hi, sigma, cfg.seed, step) if block
+                else forward_full(pm, b))
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(params, 1.0)
@@ -443,7 +474,8 @@ def distill_inner(pm, buffer, cfg: SleepConfig, cfg_b: BlockConfig, steps: int) 
         chain, _, _ = _batch(pm, b)
         with torch.no_grad():
             x = chain.run(chain.layers[:lo], chain.emb, 0).detach()
-            x = x + sigma * x.pow(2).mean().sqrt().clamp_min(1e-6) * torch.randn(x.shape)
+            x = x + sigma * x.pow(2).mean().sqrt().clamp_min(1e-6) * noise_like(
+                x, cfg_b.seed, step, lo)
         h = forward_range(chain.layers, chain, x, lo, hi)
         loss = F.mse_loss(h.float(), th[:, : h.shape[1]].float())
         opt.zero_grad(set_to_none=True)
@@ -456,6 +488,6 @@ def distill_inner(pm, buffer, cfg: SleepConfig, cfg_b: BlockConfig, steps: int) 
 
 
 __all__ = ["BlockConfig", "BlockReport", "UnsupportedModel", "block_logits", "decide",
-           "distill_inner", "forward_block", "forward_full", "layers_of",
+           "distill_inner", "forward_block", "forward_full", "layers_of", "noise_like",
            "peak_activation", "plan", "prepare", "run_both", "savings", "sigma_span",
            "split_into"]

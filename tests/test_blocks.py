@@ -21,6 +21,7 @@ from sleepy.blocks import (
     forward_block,
     forward_full,
     layers_of,
+    noise_like,
     peak_activation,
     plan,
     prepare,
@@ -88,6 +89,33 @@ def test_plan_round_robins_and_stays_in_band():
 def test_a_full_forward_and_a_block_forward_are_both_finite(tall, batches):
     assert torch.isfinite(forward_full(tall, batches[0]))
     assert torch.isfinite(forward_block(tall, batches[0], lo=3, hi=6, sigma=0.3))
+
+
+def test_the_same_seed_and_step_replay_the_same_block_noise(tall, batches):
+    # Both arms of an A/B can differ only by step when the noise is keyed; a
+    # different step must still move it, or the arms would share every draw.
+    a = forward_block(tall, batches[0], lo=3, hi=6, sigma=0.3, seed=1, step=4)
+    b = forward_block(tall, batches[0], lo=3, hi=6, sigma=0.3, seed=1, step=4)
+    c = forward_block(tall, batches[0], lo=3, hi=6, sigma=0.3, seed=1, step=5)
+    assert torch.equal(a, b)
+    assert not torch.equal(a, c)
+
+
+def test_noise_is_on_the_state_it_is_added_to():
+    # `torch.randn(x.shape)` is a CPU float32 tensor whatever `x` is, so adding
+    # it to a half-precision or CUDA state raised before; the dtype half of that
+    # is checkable without a GPU.
+    x = torch.zeros(2, 3, 4, dtype=torch.float64)
+    assert noise_like(x, None, 0, 0).dtype is torch.float64
+    assert noise_like(x, 3, 0, 0).shape == x.shape
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_noise_follows_the_state_onto_the_gpu():
+    torch.cuda.manual_seed_all(0)
+    x = torch.zeros(4, 4, device="cuda")
+    assert noise_like(x, None, 0, 0).device == x.device
+    assert noise_like(x, 7, 0, 0).device == x.device
 
 
 def test_split_halves_retained_activation(tall, batches):

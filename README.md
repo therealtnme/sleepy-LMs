@@ -34,8 +34,11 @@ similarity floors are still hand-picked, so `repetition_guard=True` with
 `repetition_train=False` collects flags on a real transcript before anyone
 trusts it to move weights. When it does train, only explicit user corrections
 pay (`repetition_explicit_only=True`) — subject and length overlap detect a
-repetition but never license the loss. `evaluation.py` (§6.9) scores the flag
-against a labelled transcript so the floors can move on evidence:
+repetition but never license the loss. Whether paying is worth it at all is a
+separate question, and `ab.py` (§6.10) asks it: the same sleep is run twice from
+one state, paid against flag-only, and judged on the pairwise margin against the
+replay loss. `evaluation.py` (§6.9) scores the flag against a labelled
+transcript so the floors can move on evidence:
 
 ```
 python -m sleepy.evaluation <transcript.jsonl> <labels.json>
@@ -165,6 +168,7 @@ python -m sleepy.demo --model HuggingFaceTB/SmolLM2-135M --blocks on   # measure
 | `sleepy/quiet.py` | learned low-traffic window, with abstention until calibrated |
 | `sleepy/repetition.py` | conversational repetition detection: pair scores, the flag vetoes, and the correction order |
 | `sleepy/evaluation.py` | offline score of the flag against a labelled transcript, its payable slice, and the ground-seeded label bootstrap |
+| `sleepy/ab.py` | the term's A/B: paid against flag-only, read as a margin gain for a replay-loss rise |
 | `sleepy/orchestrator.py` | schedule, history, and the sleep/handoff/merge loop |
 | `sleepy/demo.py` | synthetic multi-session scenario |
 

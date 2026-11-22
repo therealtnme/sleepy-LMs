@@ -907,6 +907,67 @@ the fixture is. A ground key with no turn behind it is refused, so a typo cannot
 quietly seed nothing. `--out` needs `--ground`, and the write goes to stderr
 with a "read them before trusting a number" reminder.
 
+### 6.10 `[Δ]` Whether the term is worth paying
+
+A flag and a payment are different claims. A flag says the model copied; the
+paid term says ranking the correction above the copy is better than leaving the
+weights alone. The detector can be right and the term still useless — it can
+teach the wrong thing, be outvoted by the replay loss, or fail to converge in
+one sleep. `ab.py` separates the two claims by running the *same* sleep twice
+from one state, once with `repetition_train` off and once on.
+
+Both arms clone the model and the ladder, share the seed, the pairs, the step
+count and the passes, so the only variable is the payment. Nothing is trained in
+place: the real slots are never opened and the verdict can be re-asked.
+
+The reading is the pairwise margin `log p(correction) − log p(stale)`, averaged
+over the corrected pairs. The term's own loss has `−log σ` on exactly that
+quantity, so it needs no holdout to interpret; the price of that is the margin
+being measured on the term's own training material, so a positive gain says the
+term *can* be learned, not that it generalises. A gain with no matching quality
+change is a pair being overfitted, and the replay-loss cap is what stops a
+pay-day being bought with the loss.
+
+**The gate, and why its floors read as they do.** A verdict needs evidence of
+depth before it reads a number: zero steps, no pair that reached the window, an
+unmeasurable starting margin, a paid arm that scored nothing, and margins that
+cannot be compared all refuse before the thresholds are consulted. Only then is
+the margin gain checked against `min_margin_gain` and the replay rise against
+`max_loss_rise`, so a refusal always names the *first* thing missing rather than
+the most cosmetic.
+
+**Three premises, all one-shot.** The term is paid on a single sighting
+(`repetition_loss_steps=1`) — a streak is memory across sleeps and an A/B has
+one buffer, so the shipped 2 would mature nothing and every arm would pay
+nothing. `seq_len` is floored at 256 because the fixture's prompts alone encode
+at 46 and 53 tokens, so against the shipped 64 the answer side never fits and
+the window skips the pair before a step runs. And the trust region
+(`delta_cap`) is lifted: a *relative* cap rescales the whole slot by
+`cap / worst`, and on a small model at 1e-3 that truncates every window to the
+same 1e-3 — measured, the margin then moves by about 1e-5 no matter the step
+count or the term's weight, so a floor above noise is unreachable. The weight is
+raised for the same reason: the replay term carries a batch of turns where the
+`L` term carries the pairs alone, and at the shipped weight `0.02` the replay
+gradient is around eighty times the term's in norm (measured 0.0104 against
+0.000125), so the term is outvoted by volume before it can be seen. At `5.0` the
+pair term leads instead (0.031 against 0.010), which is the direction the
+comparison needs. All three are shared by both arms, so the comparison stays
+matched; the cap removes a clipping artefact and the weight a volume deficit, and
+neither favours one side.
+
+**On the shipped fixture** the defaults (`steps=24`, `lr=2e-3`, `weight=5`) read
+a gain of `+0.025` nats for `+0.004%` replay loss and the gate passes; twelve
+steps gives `+0.008` and twenty `+0.018`, both refused on the floor, so
+twenty-four is the smallest count that clears — and it clears by little, which
+is the honest boundary. Those are CPU-stub numbers on two pairs, in trend not
+absolute value, and only the *direction* of the verdict is what they were asked
+for.
+
+The `sleepy-ab` CLI runs the detection half with no model behind it — flags,
+corrections and the pairs the licence would pay — so a transcript can be checked
+for having anything to compare before a model is loaded. `--any-basis` opens the
+licence.
+
 ## 7. Replay mix
 
 Order of protection, strongest first:
@@ -1103,6 +1164,14 @@ Resolved, with the evidence that closed each one:
   one. That is the reason detection still ships off and `repetition_train` is a
   separate switch: a real transcript has to be scored (§6.9) before any of these
   numbers is trusted to move weights.
+* **The term's A/B (§6.10) is a direction, not a deployment verdict.** It reads
+  the margin on the term's own training pairs, so a pass says the term *can* be
+  learned in one sleep, not that it generalises to a held-out ask. The gate's
+  numbers were calibrated on the two-pair invented fixture at a lifted trust
+  region; a real transcript with more pairs, or a real model with real weights,
+  would move both the gain and the floor, so `min_margin_gain` is a starting
+  floor to be re-measured, not a constant. Nothing here runs it against a real
+  model yet — only against the stub in the suite.
 * **Only the merge residual is exception-safe, not the process.** The mutate →
   gate window now rolls back in-memory state, but nothing is written to disk: a
   kill -9 between the base write and the gate still loses the commit, because the
@@ -1222,7 +1291,10 @@ save/load, and the full instrumentation table. Conversational repetition
 detection (§6.8) is built too: `repetition.py` scores, flags, and proposes
 corrections, and the `L` term is gated separately from detection by
 `repetition_train`. It ships off; `evaluation.py` (§6.9) scores it against a
-labelled transcript, but only a small invented one so far (see §9.2).
+labelled transcript, but only a small invented one so far (see §9.2), and
+`ab.py` (§6.10) answers the separate question of whether paying it beats
+flagging alone, by running the same sleep twice from one state and reading the
+pairwise margin.
 `python -m sleepy.demo` runs a multi-session scenario with
 a synthetic knowledge stream and prints the signals above so the schedule can be
 watched end to end. Numbers from a 135M CPU run are for *shape* only.

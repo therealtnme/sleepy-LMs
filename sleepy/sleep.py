@@ -155,6 +155,14 @@ class SleepConfig:
     # knowing on a live model and worth avoiding in a test, where it is one
     # generation per flag.
     repetition_teacher: bool = False
+    # Only an explicit user correction may license the loss. Subject overlap
+    # (historical) and answer shape (teacher) show a text is *about* the
+    # request, not that it answers it, so on they still fill `correction` and
+    # every counter but are paid only by a user's own "no, it's …". Off, every
+    # verified source pays, as it did before the basis existed. On by default:
+    # this is the reviewer's "explicit user corrections are the only training
+    # targets" until a real relevance check replaces it.
+    repetition_explicit_only: bool = True
 
 
 @dataclass
@@ -204,9 +212,13 @@ class SleepReport:
     # Repetition counters, six separate questions in a detector whose stages
     # are deliberately not the same stage. `flags` is detection: every pair
     # this sleep judged a failure, matured or not. `corrected` is correction: a
-    # matured flag with a verified correction, so it can never exceed `flags`;
-    # the shortfall is `uncorrected` (nothing to prefer), `unverified` (only a
-    # guess nobody vouched for) and flags that have not matured yet.
+    # matured flag with a text offered in preference, so it can never exceed
+    # `flags`; the shortfall is `uncorrected` (nothing to prefer) and flags that
+    # have not matured yet. `unverified` is the licence question, asked under
+    # `repetition_explicit_only`: a correction whose `basis` is subject overlap,
+    # answer shape or mere position — a candidate that was *found* but not paid.
+    # Detection is unaffected by the licence, so `corrected` counts it either
+    # way and `flags - corrected - uncorrected` is never negative.
     # `applied` is training: pairs whose two sides were both scored, so it can
     # never exceed `corrected` either — a pair that could not be scored lands in
     # `skipped` instead, so the gap between `corrected` and `applied` is the
@@ -593,12 +605,18 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
         # unverified one is a guess at what was wanted, and a base model's
         # answer to a subject this slot learned may pull against the slot, so
         # a guess is worse than letting the flag accumulate another sleep.
+        # `repetition_explicit_only` narrows "vouched" to the user's own words:
+        # a topic match is not an answer match, and paying one teaches the
+        # margin against the user as often as for them. Detection is untouched
+        # either way — the counters below still report what correction was
+        # *found*, and the licence decides only what may be paid.
         uncorrected = sum(1 for _, corr in repeats if corr.text is None)
+        corrected = sum(1 for _, corr in repeats if corr.text is not None)
         unverified = sum(1 for _, corr in repeats
-                         if corr.text is not None and not corr.verified)
+                         if corr.text is not None
+                         and not corr.licensed(cfg.repetition_explicit_only))
         repeats = [(cand, corr) for cand, corr in repeats
-                   if corr.text is not None and corr.verified]
-        corrected = len(repeats)
+                   if corr.licensed(cfg.repetition_explicit_only)]
         # Too long for the window is knowable without a forward, so it is
         # settled here rather than once a step inside `contrast`: `applied` then
         # counts what training was actually offered.
@@ -725,7 +743,8 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
                 logits, lm_loss = out.logits, out.loss
             else:
                 lo, hi, sigma = span[step]
-                logits, labels = blocks.block_logits(pm, batch, lo, hi, sigma)
+                logits, labels = blocks.block_logits(pm, batch, lo, hi, sigma,
+                                                     cfg.seed, step)
                 lm_loss = torch.nn.functional.cross_entropy(
                     logits.reshape(-1, logits.shape[-1]), labels.reshape(-1),
                     ignore_index=-100)

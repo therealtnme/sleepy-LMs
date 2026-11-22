@@ -304,6 +304,10 @@ def test_a_teacher_fills_in_when_the_history_has_nothing():
                              teacher=lambda q: "the loss falls fastest downhill")
     assert (got.source, got.text) == ("teacher", "the loss falls fastest downhill")
     assert got.verified is True
+    # Shape only: a real answer came back, but nothing proved it addresses the
+    # ask, so it is `licensed` only with `explicit_only` off.
+    assert got.basis == "shape"
+    assert (got.licensed(True), got.licensed(False)) == (False, True)
 
 
 def test_a_teacher_fragment_is_unverified():
@@ -320,7 +324,8 @@ def test_a_teacher_that_merely_repeats_the_stale_answer_is_unverified():
 
 def test_a_user_correction_without_a_marker_is_unverified():
     # It follows the answer, so it is the only candidate, but it opens with the
-    # next question rather than restating the ask.
+    # next question rather than restating the ask. Position is the weakest
+    # basis there is, so it fails even the loose licence.
     items = [item(0, "user", "how does gradient descent adjust the weights"),
              item(1, "assistant", "it nudges the weights along the negative gradient"),
              item(2, "user", "why does gradient descent work"),
@@ -328,7 +333,25 @@ def test_a_user_correction_without_a_marker_is_unverified():
              item(4, "user", "because the loss falls fastest that way")]
     got = repetition.correct(repetition.flagged(items, 0.5)[0], items)
     assert (got.source, got.text) == ("user", "because the loss falls fastest that way")
-    assert got.verified is False
+    assert (got.verified, got.basis) == (False, "position")
+    assert (got.licensed(True), got.licensed(False)) == (False, False)
+
+
+def test_a_longer_new_ask_still_matches_an_earlier_answer_on_its_subject():
+    # Coverage is measured against the answer's own request, so widening the new
+    # ask does not dilute the link: both are about gradient descent.
+    assert repetition._asked_about(
+        [item(0, "user", "what is gradient descent"), item(1, "assistant", "a rule")],
+        1, "how does gradient descent adjust the weights and how fast does it converge")
+
+
+def test_a_shared_generic_word_does_not_make_two_asks_the_same():
+    # "what is a tensor" and "what is a tensorflow session" share one content
+    # word in three; against the shorter side that is 100% and would pass, so
+    # the floor is put on the answer's own coverage instead.
+    assert not repetition._asked_about(
+        [item(0, "user", "what is a tensorflow session"), item(1, "assistant", "a rule")],
+        1, "what is a tensor")
 
 
 def test_an_explicit_user_correction_is_verified():
@@ -338,7 +361,8 @@ def test_an_explicit_user_correction_is_verified():
              item(3, "assistant", "it nudges the weights along the negative gradient"),
              item(4, "user", "no, it's because the loss falls fastest that way")]
     got = repetition.correct(repetition.flagged(items, 0.5)[0], items)
-    assert (got.source, got.verified) == ("user", True)
+    assert (got.source, got.verified, got.basis) == ("user", True, "explicit")
+    assert got.licensed(True)
 
 
 def test_a_verified_user_turn_beats_a_teacher_on_another_subject():
@@ -387,6 +411,8 @@ def test_a_different_earlier_answer_can_become_the_correction():
     assert got.source == "historical"
     # `a gradient` -> subject `gradient`, which the stock answer shares.
     assert got.text == "the direction the loss rises fastest"
+    # A subject link: verified, but only paid when the strict gate is off.
+    assert (got.basis, got.licensed(True), got.licensed(False)) == ("subject", False, True)
 
 
 def test_a_matching_earlier_request_can_vouch_for_a_stock_answer():
@@ -400,6 +426,9 @@ def test_a_matching_earlier_request_can_vouch_for_a_stock_answer():
                                 gap=0.8, affirm=0.0)
     got = repetition.correct(cand, items)
     assert (got.source, got.text) == ("historical", "the direction the loss rises fastest")
+    # "why do the weights go down" anchors to "what is a gradient" on `gradient`,
+    # which the stock answer also shares; still a subject link.
+    assert got.basis == "subject"
 
 
 def test_an_answer_with_no_request_above_it_has_no_correction():
@@ -456,6 +485,69 @@ def test_the_streak_pays_once_it_is_reached(pm, ladder, rep_buffer):
     assert rep.repetition_uncorrected == 0
     assert rep.repetition_unverified == 0
     assert rep.repetition_loss == rep.repetition_loss   # not NaN: the term ran
+
+
+def test_only_a_user_topic_match_is_not_paid_by_default(pm, ladder):
+    # A user turn follows the answer but never says it is correcting — position
+    # evidence only — and no teacher is offered, so nothing carries the strict
+    # licence. `corrected` still reports the pair; detection is not gated.
+    buf = Buffer(tempfile.mkdtemp() + "/h.jsonl", capacity=64)
+    buf.add_turns(1, [
+        ("user", "how does gradient descent adjust the weights", "user"),
+        ("assistant", "it nudges the weights along the negative gradient", "model"),
+        ("user", "why does gradient descent work", "user"),
+        ("assistant", "it nudges the weights along the negative gradient", "model"),
+        ("user", "because the loss falls fastest downhill", "user"),
+    ])
+    rep = sleep.run(pm, ladder, buf, ladder.slots[0],
+                    cfg_for(pm, repetition_guard=True, repetition_loss_steps=1))
+    assert (rep.repetition_flags, rep.repetition_corrected) == (1, 1)
+    assert (rep.repetition_paid, rep.repetition_unverified) == (0, 1)
+
+
+def test_the_switch_off_pays_a_topic_only_correction(pm, ladder):
+    # Nothing says the history answers the new ask — it is the same stale text
+    # under a new request — but the switch exists precisely to pay that, so
+    # with it off the subject basis clears and the pair is trained on.
+    buf = Buffer(tempfile.mkdtemp() + "/l.jsonl", capacity=64)
+    buf.add_turns(1, [
+        ("user", "how does gradient descent adjust the weights", "user"),
+        ("assistant", "it nudges the weights along the negative gradient", "model"),
+        ("user", "why does gradient descent work", "user"),
+        ("assistant", "it nudges the weights along the negative gradient of the loss", "model"),
+        ("user", "because the loss falls fastest downhill", "user"),
+    ])
+    rep = sleep.run(pm, ladder, buf, ladder.slots[0],
+                    cfg_for(pm, repetition_guard=True, repetition_loss_steps=1,
+                            repetition_explicit_only=False))
+    assert (rep.repetition_flags, rep.repetition_corrected) == (1, 1)
+    assert (rep.repetition_paid, rep.repetition_unverified) == (1, 0)
+
+
+def test_a_shape_check_still_reaches_the_teacher_under_the_strict_gate(pm, ladder):
+    # No user reply at all, so the teacher is the only candidate. Strict or
+    # not, it is *offered* and counted; strict only withholds the payment.
+    from tests.conftest import StubTokenizer
+
+    buf = Buffer(tempfile.mkdtemp() + "/t.jsonl", capacity=64)
+    buf.add_turns(1, [
+        ("user", "how does gradient descent adjust the weights", "user"),
+        ("assistant", "it nudges the weights along the negative gradient", "model"),
+        ("user", "why does gradient descent work", "user"),
+        ("assistant", "it nudges the weights along the negative gradient", "model"),
+    ])
+    class Said(StubTokenizer):
+        # `generate` returns "" without a decode, and an empty generation is
+        # indistinguishable from no teacher at all.
+        def decode(self, ids, **kw):
+            return "the loss falls fastest downhill"
+
+    cfg = cfg_for(pm, repetition_guard=True, repetition_loss_steps=1,
+                  repetition_teacher=True)
+    cfg.tokenizer = Said()
+    strict = sleep.run(pm, ladder, buf, ladder.slots[0], cfg)
+    assert (strict.repetition_corrected, strict.repetition_paid) == (1, 0)
+    assert strict.repetition_unverified == 1
 
 
 def test_an_unverified_correction_is_not_paid(pm, ladder, rep_buffer):

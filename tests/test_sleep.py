@@ -117,9 +117,9 @@ def test_block_mode_trains_one_block_per_step(buffer, workdir):
     seen = set()
     real = blk.block_logits
 
-    def spy(pm_, b, lo, hi, sigma):
+    def spy(pm_, b, lo, hi, sigma, *rest):
         seen.add((lo, hi))
-        return real(pm_, b, lo, hi, sigma)
+        return real(pm_, b, lo, hi, sigma, *rest)
 
     blk.block_logits = spy
     try:

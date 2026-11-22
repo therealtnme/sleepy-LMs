@@ -684,6 +684,17 @@ verified historical response that does match the new request; a frozen-teacher
 response, tried last and only when the buffer's own history yielded nothing.
 With no correction the candidate is metadata, never a penalty.
 
+**Relevance is not established by overlap, so overlap does not pay.** Subject
+overlap and answer length show a text is *about* the request; they cannot show
+it *answers* the request, and training on the difference teaches the margin
+against the user as often as for them. Each source therefore records `basis` —
+what actually vouched — and only `explicit` (a user's own "no, it's …") is
+evidence about content; `subject` and `shape` are topic-and-length evidence and
+`position` is only order. `repetition_explicit_only`, on by default, restricts
+the payable set to `explicit` until a real relevance check exists. Detection is
+untouched by it: the pair is still flagged, still matured and still reported,
+so turning the gate off changes what is paid and nothing else.
+
 **Preference, not a second loss over the same string.** The training signal is
 pairwise:
 
@@ -758,8 +769,10 @@ shape did not hold against the tests:
   `repeat_intent` — only a verbatim ask forgives everything, a soft "again"
   forgives half, and a transform or recall forgives nothing because both want
   the content *re-presented*. There is no semantic comparison; `Gₐ` collapsed
-  into `gap`'s subject term plus the correction sources, since an answer that
-  does not address the request shows up as no source fitting it. The similarity
+  into `gap`'s subject term plus the correction sources. Where that is not
+  enough — a source that fits by topic alone, with its content never shown to
+  answer the request — the `basis` gate withholds payment rather than the
+  detector withholding the flag. The similarity
   floors are still guesses — the default stays off for that reason.
 * `risk` is *not* the gate. The verbatim copy this subsystem exists for scores
   `gap` 0.8, and so does an asked-for repeat, so no product cutoff separates
@@ -773,12 +786,15 @@ shape did not hold against the tests:
   about this subject (or a stock answer that shares a content word with the
   fresh one), then a user turn that says it is correcting ("no, it's …"), then
   a shape-checked teacher, and last a user turn that merely follows. Every
-  branch but the bare follow-up carries its own verification, and only verified
-  text is paid. A flag with no correction is counted in `repetition_uncorrected`
-  and skipped, since without a `y_correct` there is no margin to compute; a
-  guess nobody vouched for is counted in `repetition_unverified` and skipped
-  too, because a base model's answer to a subject the slot learned can pull
-  against the slot.
+  branch but the bare follow-up carries its own verification *and* a `basis`,
+  and only `licensed()` text is paid: verified, and — with
+  `repetition_explicit_only`, the default — on the `explicit` basis alone. So
+  the historical and teacher branches are still offered and counted while
+  `repetition_unverified` records that they were not paid — detection keeps
+  collecting evidence until an independent relevance check can replace the
+  gate.
+  A flag with no correction is counted in `repetition_uncorrected` and skipped,
+  since without a `y_correct` there is no margin to compute.
 
 The `L` term is paid at most once per step, scaled by `n_passes` so the pass
 loop's 1/N does not divide it away, and it enters before the gate so a refusal
@@ -806,12 +822,15 @@ guard is on.
 
 **Counters.** Six, because the stages are not the same stage and one number
 collapses them. `flags` is detection (every pair judged a failure, matured or
-not). `corrected` is correction (a matured flag with a verified target), and the
-shortfall from `flags` is `uncorrected` (nothing better to prefer),
-`unverified` (only a guess), or not yet matured. `applied` is training and never
-exceeds `corrected`; `skipped` is the difference and `paid` is what reached the
-loss, so `paid <= applied <= corrected <= flags`. With `repetition_train` off,
-`paid` is 0 while every other count reports.
+not). `corrected` is correction (a matured flag with any text offered in
+preference), and the shortfall from `flags` is `uncorrected` (nothing better to
+prefer) or not yet matured. `unverified` is the licence question, asked under
+`repetition_explicit_only`: a correction that exists but whose `basis` is
+subject, shape or position rather than a user's own words. `applied` is
+training and never exceeds `corrected`; `skipped` is the difference and `paid`
+is what reached the loss, so `paid <= applied <= corrected <= flags`, and
+`corrected + uncorrected` never exceeds `flags` either. With
+`repetition_train` off, `paid` is 0 while every other count reports.
 
 ## 7. Replay mix
 

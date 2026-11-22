@@ -181,15 +181,22 @@ class Correction:
     previously recorded answer that matches the request.
 
     `verified` is the separate question of whether anything vouched that the
-    text actually answers *this* request, and it is what licenses the term.
-    A percent-certainty score would be false precision on lexical evidence, so
-    the field is a flag: a historical answer is verified when its own request
-    is the same one (or shares the subject), a teacher is verified when its
-    output shares a content word with the request, and a user turn is verified
-    only when it carries an explicit correction marker. A user turn without one
-    is still returned — position says it replies to the answer — but as an
-    unverified candidate, because "so anyway, what is a tensor" follows an
-    answer without correcting it.
+    text actually answers *this* request. A percent-certainty score would be
+    false precision on lexical evidence, so the field is a flag: a historical
+    answer is verified when its own request is the same one (or shares the
+    subject), a teacher is verified when its output shares a content word with
+    the request, and a user turn is verified only when it carries an explicit
+    correction marker. A user turn without one is still returned — position
+    says it replies to the answer — but as an unverified candidate, because "so
+    anyway, what is a tensor" follows an answer without correcting it.
+
+    `basis` names *what* vouched, because the kinds are not equally strong and
+    `verified` alone cannot tell them apart. `"explicit"` is a user saying the
+    answer is wrong; `"subject"` is two requests sharing subject words;
+    `"shape"` is a teacher producing something answer-shaped; `"position"` is
+    a bare follow-up. Only the first is evidence *about the content* rather
+    than about the topic or the length, which is why `licensed` can separate
+    them.
     """
     text: str | None = None
     source: str = "none"        # "user" | "teacher" | "historical" | "none"
@@ -197,6 +204,19 @@ class Correction:
     # find the exchange again. Empty when `text` is None.
     request: str = ""
     verified: bool = False
+    # "explicit" | "subject" | "shape" | "position" | ""
+    basis: str = ""
+
+    def licensed(self, explicit_only: bool) -> bool:
+        """May this correction move a weight?
+
+        `explicit_only` is the strict reading: subject overlap and answer shape
+        only show a text is *about* the question, never that it answers it, so
+        until a real relevance check exists only a user's own "no, it's …"
+        licenses the loss. Off, everything `verified` covers pays, as it did
+        before the field existed.
+        """
+        return self.verified and (not explicit_only or self.basis == "explicit")
 
 
 def _words(text: str) -> list[str]:
@@ -606,28 +626,52 @@ def _asked_about(items: list[Item], index: int, request: str) -> bool:
     no word with its own request, which is the normal shape of an answer —
     "what is a gradient" is answered "the direction the loss rises fastest" —
     so the answer's text is never the thing compared here.
+
+    Coverage is one-directional. The score is the share of the *answer's* own
+    subject that the new request covers, so "what is gradient descent" and
+    "how does gradient descent adjust the weights update them" still match:
+    the answer was about gradient descent and the new ask is too. A share of
+    the shorter of the two would pass anything either side has in common, which
+    is how "what is a tensor" and "what is a tensorflow session" became the
+    same request. One direction has a floor of 0.5 over the answer's subject;
+    the other (`_stock_fits`) is a bare anchor and is only consulted where this
+    one has already failed.
+
+    Word-level, not phrase-level: "does gradient descent converge" against
+    "is gradient descent convergent" still clears it on `gradient descent`.
+    That is the part of relevance lexical overlap cannot establish, and why
+    only an explicit correction is allowed to move weights without more.
     """
     req, _ = exchange_of(items, index)
     if req is None:
         return False
     want, got = set(_subject(request).split()), set(_subject(req.text).split())
-    return bool(want & got) and len(want & got) / min(len(want), len(got)) >= 0.5
+    # Stemmed again above the one-letter floor `_stem` uses, so `weight` and
+    # `weights` count as the same coverage rather than halving it.
+    want = {w[:-1] if len(w) > 2 else w for w in want}
+    got = {w[:-1] if len(w) > 2 else w for w in got}
+    return bool(got) and len(want & got) / len(got) >= 0.5
 
 
 def _stock_fits(items: list[Item], index: int, cand: Candidate) -> bool:
     """Is the answer at `index` a stock one about the exchange the copy landed in?
 
     The floor under a stock answer that never fitted its own request either, so
-    its own request cannot vouch for it by subject. Either weaker link will do.
-    Either the request it was written for and the fresh answer are about the
-    same thing — "a gradient" was asked, the fresh answer says "gradient" — or
-    the two answers are about the same thing ("the loss rises fastest" and
-    "because the loss falls"), which is the stock-text case.
+    its own request cannot vouch for it by subject. Either weaker link will do:
+    the request it was written for is about the fresh answer — "a gradient" was
+    asked, the fresh answer says "gradient" — or the two answers are about the
+    same thing ("the loss rises fastest" and "because the loss falls"), which is
+    the stock-text case.
 
-    Both limbs read the *fresh* answer: comparing the answer at `index` with
-    itself proves nothing when it is also the copy, which is the immediate
-    predecessor in the shape this exists for. The record only supplies the
-    earlier request.
+    Both limbs read the fresh answer, and that is the honest limit of this
+    test: it can only say the copy *belongs to* an exchange that already
+    existed, never that the words answer the question. The record supplies the
+    earlier request and the two answers' text, so an answer comparing itself
+    with itself would prove nothing when it is also the copy — hence the fresh
+    side of both limbs and the earlier *answer* rather than the earlier request
+    in the second. What either limb establishes is topic, which is exactly why
+    the result carries `basis="subject"` and `repetition_explicit_only` refuses
+    to pay it without a user's own correction.
 
     Content words only: `_subject` strips a request's shape, but an answer
     keeps it, so "an array of numbers" would otherwise hook onto "along the
@@ -695,10 +739,13 @@ def correct(cand: Candidate, items: list[Item],
     replies to the answer, and in a transcript that never replies after an
     answer it is simply the next question.
 
-    Every branch except the bare follow-up carries its own verification. Where
-    none of them is available the best guess is still returned, `verified`
-    False, so the caller can count the gamble rather than treat a guess as a
-    correction.
+    Every branch except the bare follow-up carries its own verification, and
+    each records *what* it is in `basis` — subject overlap and answer shape are
+    topic-and-length evidence, a user's marker is evidence about the content.
+    `Correction.licensed` decides from that whether the caller may train.
+    Where none of them is available the best guess is still returned,
+    `verified` False, so the caller can count the gamble rather than treat a
+    guess as a correction.
 
     One thing can never be the correction: the stale answer itself. A history
     qualifies only when it answers this request — its own request is the same
@@ -727,8 +774,9 @@ def correct(cand: Candidate, items: list[Item],
     if wanted_new and user.text is not None:
         return user
     # Backwards, so the *later* earlier answer wins: it is the freshest one and
-    # the one nearest the regression. Both limbs of the test *are* the
-    # verification, so this branch always returns verified.
+    # the one nearest the regression. Both limbs are verification, but only of
+    # the topic — neither looks at whether the text answers the request — so
+    # the basis is recorded as one and the strict licence will not pay it.
     for j in range(i - 1, -1, -1):
         if items[j].role != "assistant":
             continue
@@ -738,7 +786,8 @@ def correct(cand: Candidate, items: list[Item],
             continue
         if (_asked_about(items, j, request)
                 or _stock_fits(items, j, cand)):
-            return Correction(items[j].text, "historical", request, verified=True)
+            return Correction(items[j].text, "historical", request,
+                              verified=True, basis="subject")
     # An explicit user correction is what was actually wanted, and a teacher is
     # only checked for *shape* — that a real answer came back rather than a
     # fragment or the stale text again — because a correct answer normally
@@ -749,8 +798,9 @@ def correct(cand: Candidate, items: list[Item],
     if teacher is not None:
         said = (teacher(request) or "").strip()
         if said:
-            return Correction(said, "teacher", request,
-                          verified=_is_answer(said, cand.now.text))
+            shaped = _is_answer(said, cand.now.text)
+            return Correction(said, "teacher", request, verified=shaped,
+                              basis="shape" if shaped else "")
     return user
 
 
@@ -761,7 +811,9 @@ def _user_correction(items: list[Item], i: int, request: str) -> Correction:
     a transcript that never replies after an answer the next user turn is
     simply the next question. For a transform it goes first: the user said what
     they wanted, and no other source can. `verified` only when the turn names
-    the correction ("no, ...", "it's more like ..."); otherwise it is a guess.
+    the correction ("no, ...", "it's more like ..."), with `basis`
+    `"explicit"` — the only basis that is evidence about the content; otherwise
+    it is a guess (`"position"`).
 
     A `tool` turn is transparent here too: an errand the model ran after the
     answer does not end the turn that answers it. So is a blank user turn:
@@ -778,6 +830,8 @@ def _user_correction(items: list[Item], i: int, request: str) -> Correction:
         if not nxt.text.strip():
             continue
         if _correction_shaped(nxt.text):
-            return Correction(nxt.text, "user", request, verified=_explicit(nxt.text))
+            explicit = _explicit(nxt.text)
+            return Correction(nxt.text, "user", request, verified=explicit,
+                              basis="explicit" if explicit else "position")
         break
     return Correction()

@@ -32,7 +32,9 @@ absolute value. Known gaps are listed in DESIGN.md §9.2. Conversational
 repetition detection (§6.8) is implemented but ships off by default: the
 similarity floors are still guesses, so `repetition_guard=True` with
 `repetition_train=False` collects flags on a real transcript before anyone
-trusts it to move weights.
+trusts it to move weights. When it does train, only explicit user corrections
+pay (`repetition_explicit_only=True`) — subject and length overlap detect a
+repetition but never license the loss.
 
 ## Install
 

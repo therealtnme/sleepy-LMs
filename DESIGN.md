@@ -674,7 +674,8 @@ paraphrase requested verbatim has `Dᵢ` high and still must not count. `Gₐ` i
 one that prevents false penalties — two genuinely different questions may have
 near-identical answers, and that is only a failure if the answer does not cover
 what was asked. Thresholds are to be calibrated on labelled exchanges, not
-assumed; the "50% overlap" figure is a starting guess and not a cutoff.
+assumed; the "50% overlap" figure is a starting guess and not a cutoff. §6.9 is
+that calibration, and it is the only thing that moves a floor.
 
 **Correction is mandatory for training, optional for reporting.** Penalizing a
 stale answer only teaches the model not to repeat, not what to say instead, so a
@@ -774,7 +775,8 @@ shape did not hold against the tests:
   enough — a source that fits by topic alone, with its content never shown to
   answer the request — the `basis` gate withholds payment rather than the
   detector withholding the flag. The similarity
-  floors are still guesses — the default stays off for that reason.
+  floors are still hand-picked and the default stays off; §6.9 scores them
+  against a labelled transcript rather than leaving them guessed at.
 * `risk` is *not* the gate. The verbatim copy this subsystem exists for scores
   `gap` 0.8, and so does an asked-for repeat, so no product cutoff separates
   them. `pairs` therefore only measures (`similar >= threshold`), and `flagged`
@@ -840,6 +842,70 @@ training and never exceeds `corrected`; `skipped` is the difference and `paid`
 is what reached the loss, so `paid <= applied <= corrected <= flags`, and
 `corrected + uncorrected` never exceeds `flags` either. With
 `repetition_train` off, `paid` is 0 while every other count reports.
+
+### 6.9 Scoring the detector
+
+The counters say *what* the flag did in one run; they cannot say whether it was
+right. `evaluation.py` turns a labelled transcript into that: pairs are flagged
+exactly as `flagged` flags them, and each flag is read against the label its
+assistant turn carries.
+
+Labels are three-way, because a copy is not automatically a failure. `stale` is
+a copied answer to an ask that moved and is the error detection exists for.
+`fresh` is an answer right to stand where it is — the same answer to a re-ask,
+a paraphrase, or a stock reply — and a flag on it is the only strict false
+positive. `again` is the soft grant: the ask asked for the answer back but not
+verbatim, so a copy is a near miss, charged half on a `weighted` reading and
+not at all on recall. A flag on an unlabelled turn is a control, not a false
+positive, so a partly-labelled real transcript still yields numbers.
+
+Labels key on the `session.turn` pair, because `add_turns` numbers turns from 0
+afresh in every session — a bare turn number repeats, so a multi-session log
+could otherwise have one session's label silently land on another's answer. A
+bare integer is still accepted and read in session 0; when the log holds more
+than one session and the bare key misses, the error names the sessions so a key
+read in the wrong form is obvious. A repeated pair, a label on a non-assistant
+turn, and an unknown label are all refused rather than skipped. Every flag is
+printed in a `flags:` block, one line per flag with its risk, the pair, and a
+marker and verdict: `x` false flag, `~` half-charged `again`, `-` unlabelled
+control, and `+` a stale hit tagged either `pays` or `no correction pays`.
+
+The second reading is whether the flag is *worth* anything. A `stale` pair can
+only teach if a correction survives the `basis` licence (§6.8); the payable
+slice counts those, and `licence_rate` is the share of flagged stale pairs the
+licence lets through. This separates "the detector is wrong" from "the licence
+is strict", which every floor argument needs to know.
+
+Two premises of the offline read, not of the detector: a whole transcript is
+one window, so nothing matures and `repetition_loss_steps` cannot change the
+result, and one walk is not a sleep's windowed slice — a number here is what
+the detector would say given everything at once.
+
+The shipped fixture, `tests/data/repetition_eval.jsonl`, is invented and small —
+48 answers, a floor for regressions, not a quality claim. On it, at every
+`risk_min` tried (0.5, 0.7, 0.85, identical — the floor is not the binding
+constraint here) the flag catches 16 of 24 stale answers and flags one correct
+re-ask ("normalize the scores" against "normalize values", subject one word
+apart): precision 18/19, recall 16/24. The recall gap is mostly replay — eight
+stale answers share too little wording with the fresh one to clear `similar` at
+all, which is the lexical detectors' blind spot, not a floor to lower. The
+payable slice is 2 of 24 under the shipped `explicit_only` and 14 of 24 without
+it, so on this fixture the licence, not the detector, is where the flag's work
+is lost. Every one of those numbers is asserted in `test_evaluation.py`: move a
+floor and a test has to be re-read rather than drift.
+
+A hand-labelled 48-answer fixture is not a real run, and thousands of answers
+cannot be hand-labelled from cold, so `from_log` bootstraps a label file.
+Per-turn `run:<id>`/`step:<n>` tags on a log are joined against a ground map
+`{"run/step": {"old": ..., "new": ...}}` from an independent coverage check:
+every tagged assistant turn becomes `stale`, the rest `fresh`. The seed is
+`stale` whether or not the detector flags it — that is the whole point of a
+false-negative measurement, so a label seeded from the flag would score the flag
+against itself. It stays a bootstrap, not a hand label: the caller still re-reads
+the `again` soft grants and any replay the ground misses, which is exactly what
+the fixture is. A ground key with no turn behind it is refused, so a typo cannot
+quietly seed nothing. `--out` needs `--ground`, and the write goes to stderr
+with a "read them before trusting a number" reminder.
 
 ## 7. Replay mix
 
@@ -1026,14 +1092,17 @@ Resolved, with the evidence that closed each one:
 * **A deployment that logs only user turns cannot feed §6.8.** The detector needs
   `y_old`, the response actually given, and that only exists in tier 0. Nothing
   validates the caller's log shape against that.
-* **§6.8's floors are uncalibrated guesses.** The similarity floor, the gap and
-  `affirm` thresholds, and the `repetition_beta` weight were chosen by hand with
-  no labelled transcript behind them, so the false-positive and false-negative
-  rates of the flag are unknown — a floor too low flags legitimate parallel
-  questions, a floor too high misses the repetition it exists for. That is the
-  whole reason detection ships off and `repetition_train` is a separate switch:
-  the counters can be read against a real transcript before any of these numbers
-  is trusted to move weights.
+* **§6.8's floors are calibrated only on a small invented fixture.** The
+  similarity floor, the gap and `affirm` thresholds, and the `repetition_beta`
+  weight were chosen by hand. §6.9 scores them against a labelled transcript, so
+  the false-positive and false-negative rates are no longer unknown in kind — but
+  the shipped fixture is 48 invented answers, and the lexical detector misses the
+  eight stale replays that share too little wording to clear `similar`. A floor
+  too low flags legitimate parallel questions, a floor too high misses repeats;
+  the right direction on this fixture is not proof the numbers transfer to a real
+  one. That is the reason detection still ships off and `repetition_train` is a
+  separate switch: a real transcript has to be scored (§6.9) before any of these
+  numbers is trusted to move weights.
 * **Only the merge residual is exception-safe, not the process.** The mutate →
   gate window now rolls back in-memory state, but nothing is written to disk: a
   kill -9 between the base write and the gate still loses the commit, because the
@@ -1152,7 +1221,8 @@ rejuvenation, adaptive plasticity control, adaptive sleep depth, ladder
 save/load, and the full instrumentation table. Conversational repetition
 detection (§6.8) is built too: `repetition.py` scores, flags, and proposes
 corrections, and the `L` term is gated separately from detection by
-`repetition_train`. It ships off, and its floors are uncalibrated (see §9.2).
+`repetition_train`. It ships off; `evaluation.py` (§6.9) scores it against a
+labelled transcript, but only a small invented one so far (see §9.2).
 `python -m sleepy.demo` runs a multi-session scenario with
 a synthetic knowledge stream and prints the signals above so the schedule can be
 watched end to end. Numbers from a 135M CPU run are for *shape* only.

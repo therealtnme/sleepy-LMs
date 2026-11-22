@@ -28,6 +28,7 @@ dev = ["pytest>=8", "ruff>=0.6"]
 
 [project.scripts]
 sleepy-demo = "sleepy.demo:main"
+sleepy-eval = "sleepy.evaluation:main"
 
 [tool.setuptools]
 packages = ["sleepy"]

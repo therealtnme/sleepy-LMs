@@ -30,11 +30,33 @@ commits, bounded buffer); the demo exercises the loop end to end on a synthetic
 knowledge stream. Numbers from a 135M CPU run are meaningful in trend, not
 absolute value. Known gaps are listed in DESIGN.md §9.2. Conversational
 repetition detection (§6.8) is implemented but ships off by default: the
-similarity floors are still guesses, so `repetition_guard=True` with
+similarity floors are still hand-picked, so `repetition_guard=True` with
 `repetition_train=False` collects flags on a real transcript before anyone
 trusts it to move weights. When it does train, only explicit user corrections
 pay (`repetition_explicit_only=True`) — subject and length overlap detect a
-repetition but never license the loss.
+repetition but never license the loss. `evaluation.py` (§6.9) scores the flag
+against a labelled transcript so the floors can move on evidence:
+
+```
+python -m sleepy.evaluation <transcript.jsonl> <labels.json>
+```
+
+It prints precision, recall, the half-charged `again` reading, the payable slice
+and every flag with its risk; `--any-basis` shows what the licence would pay
+with the gate open. Labels key on `session.turn` (turns restart per session); a
+bare turn number is read in session 0.
+
+A real run is thousands of answers and cannot be hand-labelled from cold, so
+`--out` seeds a label file from a ground check instead:
+
+```
+python -m sleepy.evaluation <transcript.jsonl> --out labels.json --ground ground.json
+```
+
+`ground.json` maps `"run/step"` (from per-turn `run:`/`step:` tags) to the
+earlier and later request a coverage check found. The seed marks every tagged
+answer `stale` regardless of whether it was flagged, then you re-read the
+`again` grants before trusting a number.
 
 ## Install
 
@@ -142,6 +164,7 @@ python -m sleepy.demo --model HuggingFaceTB/SmolLM2-135M --blocks on   # measure
 | `sleepy/probe.py` | throwaway-copy plasticity exam |
 | `sleepy/quiet.py` | learned low-traffic window, with abstention until calibrated |
 | `sleepy/repetition.py` | conversational repetition detection: pair scores, the flag vetoes, and the correction order |
+| `sleepy/evaluation.py` | offline score of the flag against a labelled transcript, its payable slice, and the ground-seeded label bootstrap |
 | `sleepy/orchestrator.py` | schedule, history, and the sleep/handoff/merge loop |
 | `sleepy/demo.py` | synthetic multi-session scenario |
 

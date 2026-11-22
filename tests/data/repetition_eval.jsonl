@@ -1,0 +1,99 @@
+{"session": 0, "turn": 0, "role": "user", "text": "what is a learning rate", "source": "user", "exchange": "0.0", "ts": 1000.0, "seen": 0}
+{"session": 0, "turn": 1, "role": "assistant", "text": "how fast the optimizer moves the weights", "source": "model", "exchange": "0.0", "ts": 1001.0, "seen": 1}
+{"session": 0, "turn": 2, "role": "user", "text": "how does a learning rate affect training", "source": "user", "exchange": "0.2", "ts": 1002.0, "seen": 2}
+{"session": 0, "turn": 3, "role": "assistant", "text": "how fast the optimizer moves the weights", "source": "model", "exchange": "0.2", "ts": 1003.0, "seen": 3}
+{"session": 0, "turn": 4, "role": "user", "text": "why does batch norm speed up training", "source": "user", "exchange": "0.4", "ts": 1004.0, "seen": 4}
+{"session": 0, "turn": 5, "role": "assistant", "text": "it recentres activations at each layer", "source": "model", "exchange": "0.4", "ts": 1005.0, "seen": 5}
+{"session": 0, "turn": 6, "role": "user", "text": "why does batch norm not speed up training", "source": "user", "exchange": "0.6", "ts": 1006.0, "seen": 6}
+{"session": 0, "turn": 7, "role": "assistant", "text": "it recentres activations at each layer", "source": "model", "exchange": "0.6", "ts": 1007.0, "seen": 7}
+{"session": 0, "turn": 8, "role": "user", "text": "what is a tensor", "source": "user", "exchange": "0.8", "ts": 1008.0, "seen": 8}
+{"session": 0, "turn": 9, "role": "assistant", "text": "an array of numbers with a shape and a dtype", "source": "model", "exchange": "0.8", "ts": 1009.0, "seen": 9}
+{"session": 0, "turn": 10, "role": "user", "text": "what is a checkpoint", "source": "user", "exchange": "0.10", "ts": 1010.0, "seen": 10}
+{"session": 0, "turn": 11, "role": "assistant", "text": "an array of numbers with a shape and a dtype", "source": "model", "exchange": "0.10", "ts": 1011.0, "seen": 11}
+{"session": 0, "turn": 12, "role": "user", "text": "define perplexity", "source": "user", "exchange": "0.12", "ts": 1012.0, "seen": 12}
+{"session": 0, "turn": 13, "role": "assistant", "text": "how surprised the model is by the next token", "source": "model", "exchange": "0.12", "ts": 1013.0, "seen": 13}
+{"session": 0, "turn": 14, "role": "user", "text": "how is perplexity computed", "source": "user", "exchange": "0.14", "ts": 1014.0, "seen": 14}
+{"session": 0, "turn": 15, "role": "assistant", "text": "how surprised the model is by the next token", "source": "model", "exchange": "0.14", "ts": 1015.0, "seen": 15}
+{"session": 0, "turn": 16, "role": "user", "text": "what is a residual connection", "source": "user", "exchange": "0.16", "ts": 1016.0, "seen": 16}
+{"session": 0, "turn": 17, "role": "assistant", "text": "a skip path that adds the input back to the output", "source": "model", "exchange": "0.16", "ts": 1017.0, "seen": 17}
+{"session": 0, "turn": 18, "role": "user", "text": "what is label smoothing", "source": "user", "exchange": "0.18", "ts": 1018.0, "seen": 18}
+{"session": 0, "turn": 19, "role": "assistant", "text": "a skip path that adds the input back to the output", "source": "model", "exchange": "0.18", "ts": 1019.0, "seen": 19}
+{"session": 0, "turn": 20, "role": "user", "text": "why does weight decay prevent overfitting", "source": "user", "exchange": "0.20", "ts": 1020.0, "seen": 20}
+{"session": 0, "turn": 21, "role": "assistant", "text": "it keeps the weights small", "source": "model", "exchange": "0.20", "ts": 1021.0, "seen": 21}
+{"session": 0, "turn": 22, "role": "user", "text": "why does weight decay not prevent overfitting", "source": "user", "exchange": "0.22", "ts": 1022.0, "seen": 22}
+{"session": 0, "turn": 23, "role": "assistant", "text": "it keeps the weights small", "source": "model", "exchange": "0.22", "ts": 1023.0, "seen": 23}
+{"session": 0, "turn": 24, "role": "user", "text": "explain vanishing gradients", "source": "user", "exchange": "0.24", "ts": 1024.0, "seen": 24}
+{"session": 0, "turn": 25, "role": "assistant", "text": "gradients shrink as they backprop through the layers", "source": "model", "exchange": "0.24", "ts": 1025.0, "seen": 25}
+{"session": 0, "turn": 26, "role": "user", "text": "calculate the vanishing gradient for this loss", "source": "user", "exchange": "0.26", "ts": 1026.0, "seen": 26}
+{"session": 0, "turn": 27, "role": "assistant", "text": "gradients shrink as they backprop through the layers", "source": "model", "exchange": "0.26", "ts": 1027.0, "seen": 27}
+{"session": 0, "turn": 28, "role": "user", "text": "what is beam search", "source": "user", "exchange": "0.28", "ts": 1028.0, "seen": 28}
+{"session": 0, "turn": 29, "role": "assistant", "text": "it keeps the k most likely prefixes alive", "source": "model", "exchange": "0.28", "ts": 1029.0, "seen": 29}
+{"session": 0, "turn": 30, "role": "user", "text": "summarize beam search", "source": "user", "exchange": "0.30", "ts": 1030.0, "seen": 30}
+{"session": 0, "turn": 31, "role": "assistant", "text": "it keeps the k most likely prefixes alive", "source": "model", "exchange": "0.30", "ts": 1031.0, "seen": 31}
+{"session": 0, "turn": 32, "role": "user", "text": "what is a tokenizer", "source": "user", "exchange": "0.32", "ts": 1032.0, "seen": 32}
+{"session": 0, "turn": 33, "role": "assistant", "text": "it splits text into tokens", "source": "model", "exchange": "0.32", "ts": 1033.0, "seen": 33}
+{"session": 0, "turn": 34, "role": "user", "text": "list the steps of attention", "source": "user", "exchange": "0.34", "ts": 1034.0, "seen": 34}
+{"session": 0, "turn": 35, "role": "assistant", "text": "score, softmax, then mix the values", "source": "model", "exchange": "0.34", "ts": 1035.0, "seen": 35}
+{"session": 0, "turn": 36, "role": "user", "text": "explain how attention scoring works", "source": "user", "exchange": "0.36", "ts": 1036.0, "seen": 36}
+{"session": 0, "turn": 37, "role": "assistant", "text": "score, softmax, then mix the values", "source": "model", "exchange": "0.36", "ts": 1037.0, "seen": 37}
+{"session": 0, "turn": 38, "role": "user", "text": "does momentum help convergence", "source": "user", "exchange": "0.38", "ts": 1038.0, "seen": 38}
+{"session": 0, "turn": 39, "role": "assistant", "text": "yes, it accelerates along consistent directions", "source": "model", "exchange": "0.38", "ts": 1039.0, "seen": 39}
+{"session": 0, "turn": 40, "role": "user", "text": "does momentum hurt convergence", "source": "user", "exchange": "0.40", "ts": 1040.0, "seen": 40}
+{"session": 0, "turn": 41, "role": "assistant", "text": "yes, it accelerates along consistent directions", "source": "model", "exchange": "0.40", "ts": 1041.0, "seen": 41}
+{"session": 0, "turn": 42, "role": "user", "text": "what is a softmax", "source": "user", "exchange": "0.42", "ts": 1042.0, "seen": 42}
+{"session": 0, "turn": 43, "role": "assistant", "text": "it turns scores into a probability distribution", "source": "model", "exchange": "0.42", "ts": 1043.0, "seen": 43}
+{"session": 0, "turn": 44, "role": "user", "text": "what is a cross entropy loss", "source": "user", "exchange": "0.44", "ts": 1044.0, "seen": 44}
+{"session": 0, "turn": 45, "role": "assistant", "text": "it turns scores into a probability distribution", "source": "model", "exchange": "0.44", "ts": 1045.0, "seen": 45}
+{"session": 0, "turn": 46, "role": "user", "text": "what is a dtype", "source": "user", "exchange": "0.46", "ts": 1046.0, "seen": 46}
+{"session": 0, "turn": 47, "role": "assistant", "text": "the numeric type of a tensor, such as float32", "source": "model", "exchange": "0.46", "ts": 1047.0, "seen": 47}
+{"session": 0, "turn": 48, "role": "user", "text": "how do you free a large tensor", "source": "user", "exchange": "0.48", "ts": 1048.0, "seen": 48}
+{"session": 0, "turn": 49, "role": "assistant", "text": "drop the reference and call empty cache", "source": "model", "exchange": "0.48", "ts": 1049.0, "seen": 49}
+{"session": 0, "turn": 50, "role": "user", "text": "what is a stride", "source": "user", "exchange": "0.50", "ts": 1050.0, "seen": 50}
+{"session": 0, "turn": 51, "role": "assistant", "text": "the numeric type of a tensor, such as float32", "source": "model", "exchange": "0.50", "ts": 1051.0, "seen": 51}
+{"session": 0, "turn": 52, "role": "user", "text": "what is a bitwise and", "source": "user", "exchange": "0.52", "ts": 1052.0, "seen": 52}
+{"session": 0, "turn": 53, "role": "assistant", "text": "it keeps the bits set in both operands", "source": "model", "exchange": "0.52", "ts": 1053.0, "seen": 53}
+{"session": 0, "turn": 54, "role": "user", "text": "what is a bitwise and", "source": "user", "exchange": "0.54", "ts": 1054.0, "seen": 54}
+{"session": 0, "turn": 55, "role": "assistant", "text": "it keeps the bits set in both operands", "source": "model", "exchange": "0.54", "ts": 1055.0, "seen": 55}
+{"session": 0, "turn": 56, "role": "user", "text": "define an epoch", "source": "user", "exchange": "0.56", "ts": 1056.0, "seen": 56}
+{"session": 0, "turn": 57, "role": "assistant", "text": "one pass over the whole dataset", "source": "model", "exchange": "0.56", "ts": 1057.0, "seen": 57}
+{"session": 0, "turn": 58, "role": "user", "text": "what is an epoch", "source": "user", "exchange": "0.58", "ts": 1058.0, "seen": 58}
+{"session": 0, "turn": 59, "role": "assistant", "text": "one pass over the whole dataset", "source": "model", "exchange": "0.58", "ts": 1059.0, "seen": 59}
+{"session": 0, "turn": 60, "role": "user", "text": "how does softmax normalize the scores", "source": "user", "exchange": "0.60", "ts": 1060.0, "seen": 60}
+{"session": 0, "turn": 61, "role": "assistant", "text": "by exponentiating then dividing by the sum", "source": "model", "exchange": "0.60", "ts": 1061.0, "seen": 61}
+{"session": 0, "turn": 62, "role": "user", "text": "how does softmax normalize values", "source": "user", "exchange": "0.62", "ts": 1062.0, "seen": 62}
+{"session": 0, "turn": 63, "role": "assistant", "text": "by exponentiating then dividing by the sum", "source": "model", "exchange": "0.62", "ts": 1063.0, "seen": 63}
+{"session": 0, "turn": 64, "role": "user", "text": "what is a lint rule", "source": "user", "exchange": "0.64", "ts": 1064.0, "seen": 64}
+{"session": 0, "turn": 65, "role": "assistant", "text": "a check that flags a pattern in source code", "source": "model", "exchange": "0.64", "ts": 1065.0, "seen": 65}
+{"session": 0, "turn": 66, "role": "user", "text": "why use a type checker", "source": "user", "exchange": "0.66", "ts": 1066.0, "seen": 66}
+{"session": 0, "turn": 67, "role": "assistant", "text": "it catches mismatched shapes before running", "source": "model", "exchange": "0.66", "ts": 1067.0, "seen": 67}
+{"session": 0, "turn": 68, "role": "user", "text": "what is a lock file", "source": "user", "exchange": "0.68", "ts": 1068.0, "seen": 68}
+{"session": 0, "turn": 69, "role": "assistant", "text": "a record of the exact dependency versions", "source": "model", "exchange": "0.68", "ts": 1069.0, "seen": 69}
+{"session": 0, "turn": 70, "role": "user", "text": "what is a hash", "source": "user", "exchange": "0.70", "ts": 1070.0, "seen": 70}
+{"session": 0, "turn": 71, "role": "assistant", "text": "a fixed size fingerprint of some bytes", "source": "model", "exchange": "0.70", "ts": 1071.0, "seen": 71}
+{"session": 0, "turn": 72, "role": "user", "text": "what is a sparse tensor", "source": "user", "exchange": "0.72", "ts": 1072.0, "seen": 72}
+{"session": 0, "turn": 73, "role": "assistant", "text": "one that stores only its non zero entries", "source": "model", "exchange": "0.72", "ts": 1073.0, "seen": 73}
+{"session": 0, "turn": 74, "role": "user", "text": "what is a slot", "source": "user", "exchange": "0.74", "ts": 1074.0, "seen": 74}
+{"session": 0, "turn": 75, "role": "assistant", "text": "one rank position in the ladder", "source": "model", "exchange": "0.74", "ts": 1075.0, "seen": 75}
+{"session": 0, "turn": 76, "role": "user", "text": "explain that again", "source": "user", "exchange": "0.76", "ts": 1076.0, "seen": 76}
+{"session": 0, "turn": 77, "role": "assistant", "text": "one rank position in the ladder", "source": "model", "exchange": "0.76", "ts": 1077.0, "seen": 77}
+{"session": 0, "turn": 78, "role": "user", "text": "what is a merge gate", "source": "user", "exchange": "0.78", "ts": 1078.0, "seen": 78}
+{"session": 0, "turn": 79, "role": "assistant", "text": "a check that the merged model kept its behaviour", "source": "model", "exchange": "0.78", "ts": 1079.0, "seen": 79}
+{"session": 0, "turn": 80, "role": "user", "text": "can you say that again", "source": "user", "exchange": "0.80", "ts": 1080.0, "seen": 80}
+{"session": 0, "turn": 81, "role": "assistant", "text": "a check that the merged model kept its behaviour", "source": "model", "exchange": "0.80", "ts": 1081.0, "seen": 81}
+{"session": 0, "turn": 82, "role": "user", "text": "what is a bias term", "source": "user", "exchange": "0.82", "ts": 1082.0, "seen": 82}
+{"session": 0, "turn": 83, "role": "assistant", "text": "a constant added to the input", "source": "model", "exchange": "0.82", "ts": 1083.0, "seen": 83}
+{"session": 0, "turn": 84, "role": "user", "text": "no, it's the offset that lets the surface shift", "source": "user", "exchange": "0.84", "ts": 1084.0, "seen": 84}
+{"session": 0, "turn": 85, "role": "user", "text": "what is tokenization", "source": "user", "exchange": "0.85", "ts": 1085.0, "seen": 85}
+{"session": 0, "turn": 86, "role": "assistant", "text": "splitting text into tokens", "source": "model", "exchange": "0.85", "ts": 1086.0, "seen": 86}
+{"session": 0, "turn": 87, "role": "user", "text": "what is its size", "source": "user", "exchange": "0.87", "ts": 1087.0, "seen": 87}
+{"session": 0, "turn": 88, "role": "assistant", "text": "splitting text into tokens", "source": "model", "exchange": "0.87", "ts": 1088.0, "seen": 88}
+{"session": 0, "turn": 89, "role": "user", "text": "explain that more simply", "source": "user", "exchange": "0.89", "ts": 1089.0, "seen": 89}
+{"session": 0, "turn": 90, "role": "assistant", "text": "splitting text into tokens", "source": "model", "exchange": "0.89", "ts": 1090.0, "seen": 90}
+{"session": 0, "turn": 91, "role": "user", "text": "no, it's the number of distinct tokens", "source": "user", "exchange": "0.91", "ts": 1091.0, "seen": 91}
+{"session": 0, "turn": 92, "role": "user", "text": "what is a logit", "source": "user", "exchange": "0.92", "ts": 1092.0, "seen": 92}
+{"session": 0, "turn": 93, "role": "assistant", "text": "a pre softmax score", "source": "model", "exchange": "0.92", "ts": 1093.0, "seen": 93}
+{"session": 0, "turn": 94, "role": "user", "text": "what is its size", "source": "user", "exchange": "0.94", "ts": 1094.0, "seen": 94}
+{"session": 0, "turn": 95, "role": "assistant", "text": "a pre softmax score", "source": "model", "exchange": "0.94", "ts": 1095.0, "seen": 95}
+{"session": 0, "turn": 96, "role": "user", "text": "explain that more simply", "source": "user", "exchange": "0.96", "ts": 1096.0, "seen": 96}
+{"session": 0, "turn": 97, "role": "assistant", "text": "a pre softmax score", "source": "model", "exchange": "0.96", "ts": 1097.0, "seen": 97}
+{"session": 0, "turn": 98, "role": "user", "text": "actually, it's a score before normalization", "source": "user", "exchange": "0.98", "ts": 1098.0, "seen": 98}

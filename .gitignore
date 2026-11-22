@@ -14,6 +14,7 @@ env/
 
 # runtime artifacts
 *.jsonl
+!tests/data/*.jsonl
 workdir/
 sleepy-*/
 

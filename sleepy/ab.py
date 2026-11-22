@@ -35,8 +35,8 @@ edge of what a pair needs, so the window would skip one before any step ran.
 
 The third is the trust region. `delta_cap` rescales the whole slot to a
 worst-case relative delta of 1e-3, and the margin is only as sensitive as that
-delta — at the shipped cap a 40-step arm moves the margin by ~1e-5, well under
-any floor that could still be called a verdict. The cap is lifted for both arms
+delta — at the shipped cap a 24-step arm moves the margin by `+0.000239` against
+`+0.024735` lifted, well under any floor that could still be called a verdict. The cap is lifted for both arms
 alike, so it is still a matched comparison; it removes the truncation, not a
 premise that favoured one side. The step count and the term's weight are then
 chosen against the lifted cap: enough steps for the paid arm to move the margin

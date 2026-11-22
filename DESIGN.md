@@ -944,8 +944,9 @@ at 46 and 53 tokens, so against the shipped 64 the answer side never fits and
 the window skips the pair before a step runs. And the trust region
 (`delta_cap`) is lifted: a *relative* cap rescales the whole slot by
 `cap / worst`, and on a small model at 1e-3 that truncates every window to the
-same 1e-3 — measured, the margin then moves by about 1e-5 no matter the step
-count or the term's weight, so a floor above noise is unreachable. The weight is
+same 1e-3 — measured, a 24-step arm then moves the margin by `+0.000239`, while
+the lifted cap moves it `+0.024735`: a hundredfold, so a floor above noise is
+unreachable at the shipped cap whatever the step count or the term's weight. The weight is
 raised for the same reason: the replay term carries a batch of turns where the
 `L` term carries the pairs alone, and at the shipped weight `0.02` the replay
 gradient is around eighty times the term's in norm (measured 0.0104 against

@@ -1170,8 +1170,10 @@ Resolved, with the evidence that closed each one:
   numbers were calibrated on the two-pair invented fixture at a lifted trust
   region; a real transcript with more pairs, or a real model with real weights,
   would move both the gain and the floor, so `min_margin_gain` is a starting
-  floor to be re-measured, not a constant. Nothing here runs it against a real
-  model yet — only against the stub in the suite.
+  floor to be re-measured, not a constant. And no CLI path trains the arms
+  against a real model: `sleepy-ab` runs the detector half of the same premises
+  over a transcript and stops at the counts a model would pay, so the only
+  measured gains today are the stub's in the suite.
 * **Only the merge residual is exception-safe, not the process.** The mutate →
   gate window now rolls back in-memory state, but nothing is written to disk: a
   kill -9 between the base write and the gate still loses the commit, because the

@@ -285,73 +285,83 @@ def _provenance(source: str) -> str:
     return "model" if source in ("teacher", "historical") else source
 
 
-def answer_logprob(pm, ladder: Ladder, prompt: str, answer: str, cfg: SleepConfig,
-                   slot: Slot, source: str = "user") -> torch.Tensor | None:
-    """Mean per-token log-likelihood of `answer` given `prompt`, gradient attached.
+def _exchange(cfg: SleepConfig, prompt: str, answer: str, source: str,
+              limit: int) -> tuple[dict, int] | None:
+    """One side of a pair, ready to forward: its batch and where the answer starts.
+
+    Where the answer starts is the assistant header's end, which the padded
+    batch cannot tell us: `encode` pads on the *right*, so the unmasked span is
+    the whole exchange. Encoding the request alone gives the boundary, and
+    a request that already fills the window leaves nothing to score, so the
+    pair is refused before its answer is encoded at all — same boundary
+    `repetition_max_len` and `seq_len` bound.
+
+    The boundary carries the source tag, so only the answer's own tokens are
+    scored. Leaving the tag out would put it inside the answer's span, and a
+    `user` side has no tag while a `model` side has one: an untagged
+    correction would be one tag's worth of tokens longer than the stale
+    answer it is ranked against.
+    """
+    if not prompt or not answer.strip():
+        return None
+    start = int(encode(cfg, _turns(prompt, "", source))["attention_mask"][0].sum())
+    if start >= limit:
+        return None
+    batch = encode(cfg, _turns(prompt, answer.strip(), source))
+    if not bool(batch["attention_mask"][0, start:].any()):
+        return None            # the answer did not fit in `seq_len`
+    batch.pop("labels")
+    return batch, start
+
+
+def prepare(cfg: SleepConfig, repeats) -> tuple[list[tuple], int]:
+    """`(prepared, skipped)` — every pair both of whose sides can be scored.
+
+    Tokenizing is the part that does not change between steps, so it is done
+    once here rather than twice per step for the whole budget; the loop is then
+    left with forwards only. A pair refused here is counted as `skipped`,
+    because `applied` has to count what training was handed rather than what
+    detection offered.
+    """
+    limit = cfg.repetition_max_len or cfg.seq_len
+    out, skipped = [], 0
+    for cand, corr in repeats:
+        good = _exchange(cfg, corr.request, corr.text, _provenance(corr.source), limit)
+        bad = None if good is None else _exchange(
+            cfg, corr.request, cand.now.text, _provenance(cand.now.source), limit)
+        if good is None or bad is None:
+            skipped += 1
+            continue
+        out.append((cand, corr, good, bad))
+    return out, skipped
+
+
+def answer_logprob(pm, enc: tuple[dict, int]) -> torch.Tensor | None:
+    """Mean per-token log-likelihood of a prepared pair, gradient attached.
 
     Teacher-forced, one forward: the prompt is context, only the answer's
-    tokens are scored, and the prompt's own tokens are masked out of the label
-    the same way a pad token is. Per-token mean rather than a sum, so a short
-    stale answer does not beat a long correction by being short.
+    tokens are scored, and the prompt's own tokens are masked out the same way
+    a pad token is. Per-token mean rather than a sum, so a short stale answer
+    does not beat a long correction by being short.
 
-    Refused slots are switched off for the forward, as everywhere else: the
-    delta under judgement is this sleep's alone, and a frozen slot's opinion
-    would make the margin a comparison of the past against itself. The slot is
-    activated as the only adapter so gradients reach it; `refresh` puts the
-    ladder-wide set back in a `finally`, because a raise here must not leave
-    the next step training against a single-slot mask.
+    Nothing is switched here — mode and adapter are the caller's, so scoring a
+    whole sleep's pairs costs one switch rather than two per pair. See
+    `contrast`, which is the only caller that matters.
     """
-    # Where the answer starts is the assistant header's end, which the padded
-    # batch cannot tell us: `encode` pads on the *right*, so the unmasked span
-    # is the whole exchange. Encoding the request alone gives the boundary, and
-    # truncation by `seq_len` falls out of it — a request that already fills
-    # the window leaves nothing to score.
-    #
-    # The boundary carries the source tag, so only the answer's own tokens are
-    # scored. Leaving the tag out would put it inside the answer's span, and a
-    # `user` side has no tag while a `model` side has one: an untagged
-    # correction would be one tag's worth of tokens longer than the stale
-    # answer it is ranked against.
-    start = int(encode(cfg, _turns(prompt, "", source))["attention_mask"][0].sum())
-    batch = encode(cfg, _turns(prompt, answer.strip(), source))
-    batch.pop("labels")
-    was_training = pm.training
-    try:
-        pm.eval()
-        # The tuner's own wrapper takes a bare name and would reject the list;
-        # the model-level one accepts either, and only a list keeps the rest of
-        # the ladder out of the forward without a second call.
-        pm.base_model.set_adapter([slot.name])
-        logits = pm(**batch).logits
-    finally:
-        pm.train(was_training)
-        refresh(pm, ladder)
+    batch, start = enc
     mask = batch["attention_mask"]
     # `logits[:, t]` predicts `ids[:, t+1]`, so the two are shifted into
     # register and the prompt's last position is dropped with its tokens.
     want = batch["input_ids"][:, start:]
     keep = mask[:, start:].bool()
     if not bool(keep.any()):
-        return None            # the answer did not fit in `seq_len`
+        return None                  # nothing of the answer survived the window
+    logits = pm(**batch).logits
     picked = logits[:, start - 1:-1].gather(-1, want.clamp(min=0).unsqueeze(-1)).squeeze(-1)
     return picked[keep].mean()
 
 
-def fits(cfg: SleepConfig, prompt: str, answer: str, source: str,
-         limit: int) -> bool:
-    """Whether `answer` still has an unmasked token inside `limit`.
-
-    `answer_logprob` scores from the serialized prefix's end and returns `None`
-    once that end is at `seq_len`, so a pair too long for the window would pay
-    two forwards every step and contribute nothing. This is the same boundary
-    it derives, asked once before the loop instead of once per step per pair.
-    """
-    if not prompt or not answer.strip():
-        return False
-    return int(encode(cfg, _turns(prompt, "", source))["attention_mask"][0].sum()) < limit
-
-
-def contrast(pm, ladder: Ladder, slot: Slot, repeats,
+def contrast(pm, ladder: Ladder, slot: Slot, prepared, skipped: int,
              cfg: SleepConfig) -> tuple[torch.Tensor | None, int]:
     """`(term, skipped)` for the preference term
     `-log sigmoid(beta * (logp(correction) - logp(stale)))`.
@@ -359,35 +369,51 @@ def contrast(pm, ladder: Ladder, slot: Slot, repeats,
     A pairwise ranking rather than a target likelihood, so the model is not told
     *what* to say, only that the correction must be likelier than the answer it
     copied. Averaged over the paid pairs, and `None` when no pair produced a
-    usable forward, so a truncated pair cannot silently contribute a zero.
+    usable forward, so a refused pair cannot silently contribute a zero.
+
+    `prepared` is `prepare`'s output: both sides already encoded, so every pair
+    is one adjacent pair of forwards from one eval-mode, single-adapter segment
+    rather than a switch apiece. Refused slots are switched off for the whole
+    segment, as everywhere else: the delta under judgement is this sleep's
+    alone, and a frozen slot's opinion would make the margin a comparison of
+    the past against itself. `refresh` puts the ladder-wide set back in a
+    `finally`, because a raise here must not leave the next step training
+    against a single-slot mask.
+
+    The forwards are wrapped in `enable_grad`: this runs before the pass loop,
+    so the adapter parameters are not yet `requires_grad` and the margin would
+    otherwise be detached noise for the optimizer.
 
     Both sides go through the replay serialization, and the good side is
     tagged by provenance: a user correction is `user`, untagged as in a batch,
     and a teacher's or a history's generation is `model`, which is how a
-    non-user answer is rendered. The stale side is the row's own `source`, in
-    practice `model`. Both sides of a pair must be scored in one convention —
-    the tag changes the prompt, and a margin measured across two conventions
-    would partly measure the tag.
-
-    `skipped` counts the pairs that reached here and could not be scored, by a
-    missing request or a filled window. It is reported apart from the pairs
-    folded into the mean so a shrinking `applied` is visible rather than
-    silently reshaping the average.
+    non-user answer is rendered. The stale side carries the row's own
+    `source`, in practice `model`. Both sides of a pair must be scored in one
+    convention — the tag changes the prompt, and a margin measured across two
+    conventions would partly measure the tag.
     """
+    if not prepared:
+        return None, skipped
     terms = []
-    skipped = 0
-    for cand, corr in repeats:
-        if not corr.request:
-            skipped += 1
-            continue
-        good = answer_logprob(pm, ladder, corr.request, corr.text, cfg, slot,
-                              _provenance(corr.source))
-        bad = answer_logprob(pm, ladder, corr.request, cand.now.text, cfg, slot,
-                             _provenance(cand.now.source))
-        if good is None or bad is None:
-            skipped += 1
-            continue
-        terms.append(torch.nn.functional.softplus(-cfg.repetition_beta * (good - bad)))
+    was_training = pm.training
+    try:
+        pm.eval()
+        # The tuner's own wrapper takes a bare name and would reject the list;
+        # the model-level one accepts either, and only a list keeps the rest of
+        # the ladder out of the forward without a second call.
+        pm.base_model.set_adapter([slot.name])
+        with torch.enable_grad():
+            for _cand, _corr, good, bad in prepared:
+                lo = answer_logprob(pm, good)
+                lb = answer_logprob(pm, bad)
+                if lo is None or lb is None:
+                    skipped += 1
+                    continue
+                terms.append(torch.nn.functional.softplus(
+                    -cfg.repetition_beta * (lo - lb)))
+    finally:
+        pm.train(was_training)
+        refresh(pm, ladder)
     return (torch.stack(terms).mean() if terms else None), skipped
 
 
@@ -617,14 +643,11 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
                          and not corr.licensed(cfg.repetition_explicit_only))
         repeats = [(cand, corr) for cand, corr in repeats
                    if corr.licensed(cfg.repetition_explicit_only)]
-        # Too long for the window is knowable without a forward, so it is
-        # settled here rather than once a step inside `contrast`: `applied` then
-        # counts what training was actually offered.
-        limit = cfg.repetition_max_len or cfg.seq_len
-        repeats = [(cand, corr) for cand, corr in repeats
-                   if fits(cfg, corr.request, corr.text, _provenance(corr.source), limit)
-                   and fits(cfg, corr.request, cand.now.text,
-                            _provenance(cand.now.source), limit)]
+    # Too long for the window is knowable without a forward, so it is settled
+    # here, once, rather than per step: the pair is encoded, kept if both sides
+    # fit, and the loop is left with forwards only. `applied` then counts what
+    # training was actually offered.
+    prepared, _ = prepare(cfg, repeats)
     applied = paid = 0
     # Derived from the same identity as the in-loop line, seeded for the case
     # the loop never runs: at `budget_steps == 0` nothing is applied, so every
@@ -632,7 +655,6 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
     # `skipped = 0` under a nonzero `corrected` — the one pair a zero budget
     # silently drops from the tally.
     skipped = corrected - applied
-
     # Readout accumulators, keyed by module: a component is (module, rank index),
     # and a fresh slot's factors only exist per module.
     energy: dict[str, components.Readout] = {"grad": {}, "disp": {}}
@@ -711,7 +733,7 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
     # used only as the fallback.
     seen: dict[int, float] = {}
     prev_loss = None
-    rep_losses: list[float] = []
+    rep_losses: list[torch.Tensor] = []
     pm.train()
     while step < cfg.budget_steps:
         batch = batches[cursor % len(batches)]
@@ -723,17 +745,24 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
         # scaled by `n_passes` where it is added so the loop's 1/N keeps the
         # configured weight rather than dividing it away.
         rep_term = None
-        if repeats and cfg.repetition_train:
-            rep_term, scored_skips = contrast(pm, ladder, slot, repeats, cfg)
-            applied = len(repeats) - scored_skips
+        tlog = None
+        if prepared and cfg.repetition_train:
+            # `refused` counts the pairs a forward could not score, so they
+            # leave `applied` even though they cleared the window. It is stable
+            # across steps — same pairs, same forwards — so recomputing here
+            # rather than accumulating keeps one sleep's tally one sleep's.
+            rep_term, refused = contrast(pm, ladder, slot, prepared, 0, cfg)
+            applied = len(prepared) - refused
             if rep_term is not None:
                 paid = applied
-                rep_losses.append(float(rep_term.detach()))
+                rep_losses.append(rep_term.detach())
         elif repeats:
             # Detection without training: the corrections were still gathered
             # and counted, so the flag and correction tallies say what a paid
-            # sleep would have done, and only the weights are missing.
-            applied = len(repeats)
+            # sleep would have done, and only the weights are missing. What a
+            # paid sleep would have done is `prepared`, not `repeats` — a pair
+            # the window already refused is a skip either way.
+            applied = len(prepared)
         # Derived rather than accumulated: `repeats` is the same list every
         # step, so adding per-step scraps would count one pair once per step.
         skipped = corrected - applied
@@ -754,9 +783,13 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
             # KL against the clean teacher is dominated by the noise scale, not
             # by what the step learned.
             if beta > 0 and span is None:
-                with torch.no_grad():
-                    tlog = teacher(input_ids=batch["input_ids"],
-                                   attention_mask=batch["attention_mask"]).logits
+                # The batch is the same for every pass of a step and the
+                # teacher is frozen, so its logits are taken once per step and
+                # reused; only the annealing weight changes between passes.
+                if tlog is None:
+                    with torch.no_grad():
+                        tlog = teacher(input_ids=batch["input_ids"],
+                                       attention_mask=batch["attention_mask"]).logits
                 loss = loss + beta * signals.kl_guard(logits, tlog)
             if rep_term is not None and pass_i == 0:
                 loss = loss + cfg.repetition_loss_weight * n_passes * rep_term
@@ -1001,7 +1034,10 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
         repetition_applied=applied, repetition_skipped=skipped,
         repetition_paid=paid, repetition_uncorrected=uncorrected,
         repetition_unverified=unverified,
-        repetition_loss=(sum(rep_losses) / len(rep_losses)
+        # Detached per step and read as one tensor: converting each to a float
+        # inside the loop syncs the GPU every step for a number nothing reads
+        # until here.
+        repetition_loss=(float(torch.stack(rep_losses).mean())
                          if rep_losses else float("nan")))
 
 

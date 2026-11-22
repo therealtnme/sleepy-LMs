@@ -463,8 +463,9 @@ def exchange_of(items: list[Item], index: int) -> tuple[Item | None, Item | None
     # A blank user turn is client padding (assistant prefill writes one), so it
     # is transparent in every direction. As the request it has no subject at
     # all, so `gap` scores it 0.8 against everything — the unmatched-subject
-    # answer — and the copy is flagged every sleep even though `fits()` drops an
-    # empty prompt, so it can never be paid and the flag never clears. As a
+    # answer — and the copy is flagged every sleep even though `_exchange`
+    # refuses an empty prompt, so it can never be paid and the flag never
+    # clears. As a
     # boundary it would cut the exchange off from the ask it belongs to.
     lo = index
     crossed = False

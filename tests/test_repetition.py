@@ -202,8 +202,8 @@ def test_a_system_turn_is_transparent_in_both_directions():
 def test_a_blank_user_turn_does_not_become_the_request():
     # Assistant prefill writes a blank user turn. Left alone it has no subject,
     # so `gap` scores it 0.8 against everything and the copy is flagged every
-    # sleep — including behind `fits()`, which drops an empty prompt, so the
-    # flag never clears. The real ask underneath is the request.
+    # sleep — including behind `_exchange`, which refuses an empty prompt, so
+    # the flag never clears. The real ask underneath is the request.
     items = [item(0, "user", "what is a tensor"),
              item(1, "assistant", "an array of numbers"),
              item(2, "user", ""),

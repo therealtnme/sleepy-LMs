@@ -750,7 +750,8 @@ id, fusing the pair onto the old group on replay.
 own optimizer, weighted small (`~0.02`) so the replay loss keeps dominating —
 otherwise the slot fits the preference instead of the content. It needs two
 extra forwards per pair (no teacher, no second model at inference), so it is
-capped by a pair count, not run over the whole history. It is a delta like any
+capped by a pair count and — because the batch does not change across passes —
+scored once per step, not once per pass. It is a delta like any
 other: the commit gate sees it and a refusal rolls it back with the rest. Staged:
 detection and reporting first (`repetition_train` off), then correction quality,
 then the `L` term. Default off until detection is shown to flag real failures on
@@ -803,6 +804,14 @@ ladder's other slots switched off, so it compares this sleep's delta against
 itself rather than against the frozen past. Per-token means, so a short stale
 answer cannot win by being short.
 
+The pairs do not depend on the step, so they are encoded once before the loop
+and the loop is left with forwards only: one eval-mode, single-adapter segment
+for the whole sleep rather than a switch and a re-tokenization apiece. Step
+losses are accumulated detached and reduced once, so the budget costs one
+device sync instead of one per step. The KL guard's teacher logits are cached
+the same way — the teacher is frozen and the step's batch is fixed, so only the
+annealing weight changes between passes.
+
 Streaks live on `Ladder.repetition_streaks` and are persisted beside
 `sleep_depth` (§6.7): one flag is a candidate, and `repetition_loss_steps`
 consecutive flags are what buys a payment, so the state has to outlive the
@@ -812,13 +821,13 @@ aged — a pair that stops looking stale should stop being paid at once.
 Two costs worth knowing. The answer boundary is the prompt's own encoded
 length, so both halves of a pair have to fit in `seq_len` or there is no
 unmasked answer token left to score. Pairs beyond `repetition_max_len` (0 means
-`seq_len`) are filtered once before the loop and counted in
-`repetition_skipped`, and any pair the forward still refuses lands there too, so
-`repetition_applied` is what training was actually handed and the mean is not
-quietly taken over a smaller set than `repetition_corrected` promised. A live
-`seq_len` is far above the ~80 tokens a pair needs. And the teacher is one
-generation per uncorrected flag, which is why it is off by default even when the
-guard is on.
+`seq_len`) are encoded out once before the loop, and a refused pair lands in
+`repetition_skipped`: `repetition_applied` is what training was actually
+handed, and the mean is not quietly taken over a smaller set than
+`repetition_corrected` promised. A pair the forward still refuses is counted
+the same way, rather than zeroing the term. A live `seq_len` is far above the
+~80 tokens a pair needs. And the teacher is one generation per uncorrected
+flag, which is why it is off by default even when the guard is on.
 
 **Counters.** Six, because the stages are not the same stage and one number
 collapses them. `flags` is detection (every pair judged a failure, matured or

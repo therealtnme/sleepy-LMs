@@ -56,7 +56,7 @@ def test_a_buffer_with_no_corrected_pair_is_refused(pm, ladder, workdir):
 
 def test_the_depth_of_evidence_is_read_before_either_margin():
     grounded = ab.ABReport(pairs=2, base_margin=0.1, flag_margin=0.1, paid_margin=0.15,
-                           flag_loss=5.0, paid_loss=5.0)
+                           flag_loss=5.0, paid_loss=5.0, paid_pays=2)
     assert ab.verdict(grounded, ab.ABConfig())[0]
     # Each failure below holds everything else at a passing value, so the
     # refusal it produces is the one under test.
@@ -71,15 +71,43 @@ def test_the_depth_of_evidence_is_read_before_either_margin():
 
 def test_a_margin_under_the_floor_is_refused():
     rep = ab.ABReport(pairs=2, base_margin=0.1, flag_margin=0.1, paid_margin=0.11,
-                      flag_loss=5.0, paid_loss=5.0)
+                      flag_loss=5.0, paid_loss=5.0, paid_pays=2)
     ok, reason = ab.verdict(rep, ab.ABConfig(min_margin_gain=0.02))
     assert not ok
     assert "want >= +0.02" in reason
 
 
+def test_an_unmeasured_replay_price_is_refused():
+    # A gain well past the floor, so only the price is under test. `inf` is a
+    # divergence, *not* an unrun arm — a paid arm that ran no step reads
+    # `loss_last=nan` and already refuses on the margin. A zero flag loss
+    # cannot form a relative rise, and a zero paid loss is a real -100%.
+    grounded = dict(pairs=2, base_margin=0.1, flag_margin=0.1, paid_margin=0.2,
+                    flag_loss=5.0, paid_loss=5.0, paid_pays=2)
+    for field in (dict(paid_loss=math.inf), dict(flag_loss=math.nan),
+                  dict(flag_loss=0.0)):
+        rep = ab.ABReport(**{**grounded, **field})
+        ok, reason = ab.verdict(rep, ab.ABConfig())
+        assert not ok, (field, reason)
+        assert "replay price unmeasured" in reason
+    # A paid loss of 0 is a measured free lunch, not an unknown one.
+    assert ab.verdict(ab.ABReport(**{**grounded, "paid_loss": 0.0}), ab.ABConfig())[0]
+
+
+def test_a_paid_arm_that_scored_but_paid_nothing_is_refused():
+    # Gain and price would both pass; only the payment is under test. Both arms
+    # train replay, so this margin is reachable without the term when it is
+    # weighted to zero or every pair is refused by the forward.
+    grounded = dict(pairs=2, base_margin=0.1, flag_margin=0.1, paid_margin=0.2,
+                    flag_loss=5.0, paid_loss=5.0, paid_pays=2)
+    ok, reason = ab.verdict(ab.ABReport(**{**grounded, "paid_pays": 0}), ab.ABConfig())
+    assert not ok
+    assert reason == "paid arm paid nothing"
+
+
 def test_a_replay_loss_rise_over_the_cap_is_refused():
     rep = ab.ABReport(pairs=2, base_margin=0.1, flag_margin=0.1, paid_margin=0.2,
-                      flag_loss=5.0, paid_loss=5.5)
+                      flag_loss=5.0, paid_loss=5.5, paid_pays=2)
     ok, reason = ab.verdict(rep, ab.ABConfig())
     assert not ok
     assert "replay loss +10.0%" in reason
@@ -93,6 +121,7 @@ def test_the_paid_arm_moves_the_margin_the_flag_arm_does_not(pm, ladder, workdir
     # Both corrections are on the buffer and both clear the window; nothing is
     # skipped, so the margin below is over the same pairs in both arms.
     assert (rep.pairs, rep.flag_skipped, rep.paid_skipped) == (2, 0, 0)
+    assert rep.paid_pays == 2
     # The flag-only arm still trains replay, so it is the baseline both
     # readings are against; only the paid arm is over it, in the direction the
     # term's own loss rewards. The gain is taken flag-minus-paid precisely so

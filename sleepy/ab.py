@@ -42,7 +42,7 @@ premise that favoured one side. The step count and the term's weight are then
 chosen against the lifted cap: enough steps for the paid arm to move the margin
 and enough weight that the replay term, which carries a batch of turns against
 the pairs alone, does not outvote it — at the shipped 0.02 it outweighs the term
-about 80:1 by norm. Both are minima, not ceilings — a longer or heavier arm only
+about 45:1 by norm. Both are minima, not ceilings — a longer or heavier arm only
 widens the gap.
 """
 
@@ -76,7 +76,7 @@ class ABConfig:
     seq_len: int = 256  # floor on the encoding window; a pair must fit whole
     # The trust-region cap is off for the arms (see the module doc) and the term
     # is weighted up: at a lifted cap the replay gradient still outweighs the
-    # term ~80:1 at the shipped 0.02, and a 24-step arm cannot show a lift. Both
+    # term ~45:1 at the shipped 0.02, and a 24-step arm cannot show a lift. Both
     # arms share these values, so the comparison stays matched.
     lr: float = 2e-3
     loss_weight: float = 5.0
@@ -94,6 +94,7 @@ class ABReport:
     paid_loss: float = float("nan")
     flag_skipped: int = 0
     paid_skipped: int = 0
+    paid_pays: int = 0  # pairs the paid arm actually put the term on
     gate_ok: bool = False
     reason: str = ""
 
@@ -107,6 +108,7 @@ class ABReport:
         "paid_loss",
         "flag_skipped",
         "paid_skipped",
+        "paid_pays",
         "gate_ok",
         "reason",
     )
@@ -200,13 +202,29 @@ def verdict(rep: ABReport, cfg: ABConfig) -> tuple[bool, str]:
         return False, "margin unmeasured before the run"
     if not signals_finite(rep.paid_margin):
         return False, "paid arm scored no pair after the run"
+    # Scored is not paid: both arms train replay, and a zero-weight or fully
+    # refused term still moves the margin off the replay drift alone. A gain
+    # the term did not produce says nothing about the term, so this refuses
+    # with the other depth checks, before any floor is read.
+    if rep.paid_pays == 0:
+        return False, "paid arm paid nothing"
     gain = rep.margin_gain()
     if not signals_finite(gain):
         return False, "arm margins do not compare"
     if gain < cfg.min_margin_gain:
         return False, f"margin only {gain:+.3f} nats, want >= {cfg.min_margin_gain:+.2f}"
     rise = rep.loss_rise()
-    if signals_finite(rise) and rise > cfg.max_loss_rise:
+    # An unmeasured price is not a cheap one: `inf` overshoots any cap and a
+    # zero flag loss cannot form a relative rise. Only a finite pair of losses
+    # off a positive baseline says anything, and the cap is the only thing
+    # keeping a gain from being bought with the replay loss.
+    if (
+        not (signals_finite(rep.paid_loss) and signals_finite(rep.flag_loss))
+        or rep.flag_loss <= 0
+        or not signals_finite(rise)
+    ):
+        return False, "replay price unmeasured"
+    if rise > cfg.max_loss_rise:
         return False, f"replay loss +{rise:.1%} > {cfg.max_loss_rise:.0%}"
     return True, f"margin {gain:+.3f} nats for {rise:+.1%} replay loss"
 
@@ -253,11 +271,9 @@ def ab(pm, ladder, buffer: Buffer, cfg: SleepConfig, cfg_ab: ABConfig | None = N
         rep.flag_loss, rep.flag_skipped, _, rep.flag_margin = _arm(
             pm, ladder, cfg, prepared, cfg_ab.steps, train=False
         )
-        rep.paid_loss, rep.paid_skipped, paid, rep.paid_margin = _arm(
+        rep.paid_loss, rep.paid_skipped, rep.paid_pays, rep.paid_margin = _arm(
             pm, ladder, cfg, prepared, cfg_ab.steps, train=True
         )
-        if paid == 0:
-            rep.reason = "paid arm paid nothing"
     rep.gate_ok, reason = verdict(rep, cfg_ab)
     if not rep.reason:
         rep.reason = reason
@@ -292,7 +308,7 @@ def main(argv: list[str] | None = None) -> int:
     buf = Buffer(path, capacity=len(items) + 1)
     buf.add_turns(0, [(it.role, it.text, it.source) for it in items])
 
-    from tests.conftest import StubTokenizer
+    from .tokens import StubTokenizer
 
     # The one-shot premises of the A/B, so the CLI detects what a real arm
     # would pay: a single sighting (a shipped streak of 2 can never mature in

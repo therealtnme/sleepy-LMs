@@ -37,11 +37,17 @@ pay (`repetition_explicit_only=True`) — subject and length overlap detect a
 repetition but never license the loss. Whether paying is worth it at all is a
 separate question, and `ab.py` (§6.10) asks it: the same sleep is run twice from
 one state, paid against flag-only, and judged on the pairwise margin against the
-replay loss. `evaluation.py` (§6.9) scores the flag against a labelled
-transcript so the floors can move on evidence:
+replay loss. Checking a transcript for anything to compare needs no model:
 
 ```
-python -m sleepy.evaluation <transcript.jsonl> <labels.json>
+sleepy-ab <transcript.jsonl>          # flags, corrections, and licences
+```
+
+`evaluation.py` (§6.9) scores the flag against a labelled transcript so the
+floors can move on evidence:
+
+```
+sleepy-eval <transcript.jsonl> <labels.json>
 ```
 
 It prints precision, recall, the half-charged `again` reading, the payable slice

@@ -891,8 +891,9 @@ stale answers share too little wording with the fresh one to clear `similar` at
 all, which is the lexical detectors' blind spot, not a floor to lower. The
 payable slice is 2 of 24 under the shipped `explicit_only` and 14 of 24 without
 it, so on this fixture the licence, not the detector, is where the flag's work
-is lost. Every one of those numbers is asserted in `test_evaluation.py`: move a
-floor and a test has to be re-read rather than drift.
+is lost. Precision, recall and both payable counts are pinned in
+`test_evaluation.py`: move a floor and a test has to be re-read rather than
+drift.
 
 A hand-labelled 48-answer fixture is not a real run, and thousands of answers
 cannot be hand-labelled from cold, so `from_log` bootstraps a label file.
@@ -906,6 +907,14 @@ the `again` soft grants and any replay the ground misses, which is exactly what
 the fixture is. A ground key with no turn behind it is refused, so a typo cannot
 quietly seed nothing. `--out` needs `--ground`, and the write goes to stderr
 with a "read them before trusting a number" reminder.
+
+A real transcript arrives from elsewhere, so an input defect is the caller's and
+is named with the file and line it came from — a missing file, a line that is
+not JSON, a turn with no role or a missing/mistyped field, a non-numeric `step:`
+tag, or a labels/ground file that is a list instead of an object — rather than
+escaping as a traceback from inside the parser. `argparse` prints
+`sleepy-eval: error: <path>: <reason>` and exits 2, as it already does for the
+two misuse paths (`--out` without `--ground`, no labels file).
 
 ### 6.10 `[Δ]` Whether the term is worth paying
 
@@ -930,18 +939,24 @@ pay-day being bought with the loss.
 
 **The gate, and why its floors read as they do.** A verdict needs evidence of
 depth before it reads a number: zero steps, no pair that reached the window, an
-unmeasurable starting margin, a paid arm that scored nothing, and margins that
-cannot be compared all refuse before the thresholds are consulted. Only then is
-the margin gain checked against `min_margin_gain` and the replay rise against
-`max_loss_rise`, so a refusal always names the *first* thing missing rather than
-the most cosmetic.
+unmeasurable starting margin, a paid arm that scored nothing, a paid arm that
+paid nothing, and margins that cannot be compared all refuse before the
+thresholds are consulted. Scoring and paying are separate: both arms train
+replay, so the margin moves even when the term never lands, and a gain the term
+did not produce is no evidence of it. Only then is
+the margin gain checked against `min_margin_gain`; the price follows, and a
+gain whose price is unmeasured — `inf` overshoots any cap, and a zero flag loss
+cannot even form a relative rise — refuses rather than passing on the margin
+alone. A refusal always names the *first* thing missing rather than the most
+cosmetic.
 
 **Three premises, all one-shot.** The term is paid on a single sighting
 (`repetition_loss_steps=1`) — a streak is memory across sleeps and an A/B has
 one buffer, so the shipped 2 would mature nothing and every arm would pay
 nothing. `seq_len` is floored at 256 because the fixture's prompts alone encode
-at 46 and 53 tokens, so against the shipped 64 the answer side never fits and
-the window skips the pair before a step runs. And the trust region
+at 46 and 53 tokens, so against the shipped 64 the answers are cut to 18 and 38
+tokens — a margin over the first few characters, not the answer — while 256 keeps
+them whole. And the trust region
 (`delta_cap`) is lifted: a *relative* cap rescales the whole slot by
 `cap / worst`, and on a small model at 1e-3 that truncates every window to the
 same 1e-3 — measured, a 24-step arm then moves the margin by `+0.000239`, while
@@ -949,10 +964,10 @@ the lifted cap moves it `+0.024735`: a hundredfold, so a floor above noise is
 unreachable at the shipped cap whatever the step count or the term's weight. The weight is
 raised for the same reason: the replay term carries a batch of turns where the
 `L` term carries the pairs alone, and at the shipped weight `0.02` the replay
-gradient is around eighty times the term's in norm (measured 0.0104 against
-0.000125), so the term is outvoted by volume before it can be seen. At `5.0` the
-pair term leads instead (0.031 against 0.010), which is the direction the
-comparison needs. All three are shared by both arms, so the comparison stays
+gradient is around forty-five times the term's in norm (measured 45:1), so the
+term is outvoted by volume before it can be seen. At `5.0` the pair term leads
+instead (measured 5.6:1 the other way), which is the direction the comparison
+needs. All three are shared by both arms, so the comparison stays
 matched; the cap removes a clipping artefact and the weight a volume deficit, and
 neither favours one side.
 
@@ -967,7 +982,10 @@ for.
 The `sleepy-ab` CLI runs the detection half with no model behind it — flags,
 corrections and the pairs the licence would pay — so a transcript can be checked
 for having anything to compare before a model is loaded. `--any-basis` opens the
-licence.
+licence. Detection has to encode, so the CLI uses the same deterministic
+`StubTokenizer` the suite does, now shipped as `sleepy/tokens.py` with the suite
+importing it: a pip install carries no `tests/`, and borrowing the stub from a
+`conftest` meant the installed console script died on its first import.
 
 ## 7. Replay mix
 

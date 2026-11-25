@@ -3,7 +3,7 @@
 The floors are hand-picked (§9.2), so what the flag is worth is not known; this
 turns a labelled run into the numbers that would say. It exists to be run
 against a real transcript, and the shipped fixture is only the shape of one:
-41 invented exchanges, every answer labelled with what the *next* ask makes it.
+48 invented exchanges, every answer labelled with what the *next* ask makes it.
 
 Three labels, not two. `stale` is a copied answer to an ask that moved — the
 failure. `fresh` is an answer that is right to stand where it is: the same
@@ -46,24 +46,78 @@ _KINDS = ("stale", "fresh", "again")
 _WEIGHT = {"stale": 1.0, "again": 0.5}
 
 
+def _read_json(path: Path, line: int | None = None, text: str | None = None):
+    """`json.loads` naming the file and line it failed on, not the decoder's offset.
+
+    A missing file is named too: the CLI reports any `ValueError` with the path
+    already in it, and an OSError would otherwise be the one defect that still
+    escaped as a traceback.
+    """
+    where = f"{path}:{line}" if line is not None else str(path)
+    try:
+        return json.loads(text if text is not None else path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"{where}: {exc.strerror or exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{where}: not JSON ({exc.msg} at column {exc.colno})") from exc
+
+
+_FIELDS = {"session": int, "turn": int, "text": str}
+
+
+def _tags(path: Path, line: int, raw) -> list[str]:
+    """`raw` as a list of strings — `from_log` reads `run:<id>` off these, and a
+    bare string would otherwise be split into characters, not tags."""
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list | tuple):
+        raise ValueError(f"{path}:{line}: tags {raw!r} is not a list")
+    for tag in raw:
+        if not isinstance(tag, str):
+            raise ValueError(f"{path}:{line}: tag {tag!r} is not a string")
+    return list(raw)
+
+
 def parse(transcript: Path) -> list[Item]:
     """The items of one JSONL log, in file order.
 
     The log is the buffer's own on-disk shape; an unknown role is refused so a
-    stray export cannot be scored as if it were turns.
+    stray export cannot be scored as if it were turns. The fields the eval needs
+    are named the same way, since a `KeyError` or a bare `int()` failure would
+    only say `'session'` or `invalid literal` and not where.
     """
     items = []
-    for n, line in enumerate(transcript.read_text(encoding="utf-8").splitlines()):
+    try:
+        text = transcript.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"{transcript}: {exc.strerror or exc}") from exc
+    for n, line in enumerate(text.splitlines()):
         line = line.strip()
         if not line:
             continue
-        d = json.loads(line)
+        d = _read_json(transcript, n, line)
+        if not isinstance(d, dict):
+            raise ValueError(f"{transcript}:{n}: not a JSON object")
+        if "role" not in d:
+            raise ValueError(f"{transcript}:{n}: no role field")
         if d["role"] not in _ROLE:
             raise ValueError(f"{transcript}:{n}: unknown role {d['role']!r}")
-        items.append(Item(session=int(d["session"]), turn=int(d["turn"]),
+        for name, kind in _FIELDS.items():
+            if name not in d:
+                raise ValueError(f"{transcript}:{n}: no {name} field")
+            try:
+                d[name] = kind(d[name])
+            except (TypeError, ValueError):
+                raise ValueError(f"{transcript}:{n}: {name} {d[name]!r} is not an "
+                                 f"{kind.__name__}") from None
+        try:
+            ts = float(d.get("ts", 0.0))
+        except (TypeError, ValueError):
+            raise ValueError(f"{transcript}:{n}: ts {d['ts']!r} is not a float") from None
+        items.append(Item(session=d["session"], turn=d["turn"],
                           role=d["role"], text=d["text"], source=d.get("source", "user"),
-                          exchange=d.get("exchange", ""), ts=float(d.get("ts", 0.0)),
-                          tags=list(d.get("tags", []))))
+                          exchange=d.get("exchange", ""), ts=ts,
+                          tags=_tags(transcript, n, d.get("tags", []))))
     return items
 
 
@@ -90,7 +144,9 @@ def load(transcript: Path, labels: Path) -> tuple[list[Item], dict[str, str]]:
     if len(by_key) != len(items):
         raise ValueError(f"{transcript}: a session/turn pair repeats")
     paired = {(it.session, it.turn) for it in items}
-    raw = json.loads(labels.read_text(encoding="utf-8"))
+    raw = _read_json(labels)
+    if not isinstance(raw, dict):
+        raise ValueError(f"{labels}: labels must be a JSON object, got {type(raw).__name__}")
     out: dict[str, str] = {}
     for key, kind in raw.items():
         m = re.fullmatch(r"(-?\d+)\.(-?\d+)", key)
@@ -244,8 +300,11 @@ def from_log(log: Path, ground: Path, out: Path) -> dict[str, str]:
     soft grants and any replay the ground misses, which is what the fixture is.
     """
     items = parse(log)
+    raw = _read_json(ground)
+    if not isinstance(raw, dict):
+        raise ValueError(f"{ground}: ground must be a JSON object, got {type(raw).__name__}")
     seeds = {}
-    for key, pair in json.loads(ground.read_text(encoding="utf-8")).items():
+    for key, pair in raw.items():
         m = re.fullmatch(r"(?P<run>.+)/(?P<step>-?\d+)", key)
         if not m:
             raise ValueError(f"{ground}: {key!r} is not <run>/<step>")
@@ -255,7 +314,12 @@ def from_log(log: Path, ground: Path, out: Path) -> dict[str, str]:
         tags = dict(t.split(":", 1) for t in it.tags if ":" in t)
         if "run" not in tags or "step" not in tags:
             return None
-        return tags["run"], int(tags["step"])
+        try:
+            step = int(tags["step"])
+        except ValueError:
+            raise ValueError(f"{log}: turn {item_key(it)} has step {tags['step']!r}, "
+                             "not an integer") from None
+        return tags["run"], step
 
     have = {p for p in (prov(it) for it in items) if p is not None}
     for (run, step) in seeds:
@@ -291,17 +355,21 @@ def main(argv: list[str] | None = None) -> int:
                     help="score every correction, not only the explicit basis")
     args = ap.parse_args(argv)
 
-    if args.out:
-        if not args.ground:
-            ap.error("--out needs --ground")
-        seeded = from_log(args.transcript, args.ground, args.out)
-        sys.stderr.write(f"wrote {len(seeded)} labels to {args.out}; "
-                         "read them before trusting a number\n")
-        return 0
-    if not args.labels:
-        ap.error("a labels file is required (or --out with --ground)")
-
-    items, labels = load(args.transcript, args.labels)
+    # A malformed input is the caller's, not a crash in the scorer, so it is
+    # named with the file it came from rather than escaping as a traceback.
+    try:
+        if args.out:
+            if not args.ground:
+                ap.error("--out needs --ground")
+            seeded = from_log(args.transcript, args.ground, args.out)
+            sys.stderr.write(f"wrote {len(seeded)} labels to {args.out}; "
+                             "read them before trusting a number\n")
+            return 0
+        if not args.labels:
+            ap.error("a labels file is required (or --out with --ground)")
+        items, labels = load(args.transcript, args.labels)
+    except (ValueError, KeyError, TypeError, OSError, json.JSONDecodeError) as exc:
+        ap.error(str(exc))
     got = score(items, labels, risk_min=args.risk_min, max_pairs=args.max_pairs,
                 window=args.window, explicit_only=not args.any_basis)
     sys.stdout.write(got.text())

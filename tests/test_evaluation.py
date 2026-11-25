@@ -201,6 +201,88 @@ def test_the_cli_opens_the_licence_on_request(capsys):
     assert "payable   14 stale of 24" in capsys.readouterr().out
 
 
+def test_the_cli_names_a_malformed_input_instead_of_crashing(tmp_path, capsys):
+    # An input defect is the caller's, so the CLI has to say which file is bad
+    # and why — `argparse.error` exits 2 and writes to stderr, where a bare
+    # JSONDecodeError traceback would only point at a line in `load`.
+    empty = tmp_path / "empty.json"
+    empty.write_text("", encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:
+        evaluation.main([str(DATA / "repetition_eval.jsonl"), str(empty)])
+    assert exc.value.code == 2
+    assert "empty.json" in capsys.readouterr().err
+
+    # A list where the labels should be an object: `load` would `.items()` a
+    # list and fail with an AttributeError, not a named path.
+    shaped = tmp_path / "list.json"
+    shaped.write_text("[]", encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:
+        evaluation.main([str(DATA / "repetition_eval.jsonl"), str(shaped)])
+    assert exc.value.code == 2
+    assert "list.json: labels must be a JSON object" in capsys.readouterr().err
+
+    # A missing file is named the same way, not left to a FileNotFoundError —
+    # whether it is the transcript or the labels that is gone.
+    for gone in (tmp_path / "gone.jsonl", tmp_path / "gone.json"):
+        with pytest.raises(SystemExit) as exc:
+            evaluation.main([str(gone if gone.suffix == ".jsonl" else
+                                 DATA / "repetition_eval.jsonl"), str(gone)])
+        assert exc.value.code == 2
+        assert "gone.json" in capsys.readouterr().err
+
+
+def test_a_turn_with_no_role_is_refused_by_name(tmp_path):
+    log = tmp_path / "t.jsonl"
+    log.write_text(json.dumps({"session": 0, "turn": 0, "text": "x"}), encoding="utf-8")
+    with pytest.raises(ValueError, match=r"t\.jsonl:0: no role field"):
+        evaluation.parse(log)
+
+
+def test_a_missing_or_mistyped_field_names_the_file_and_line(tmp_path):
+    log = tmp_path / "t.jsonl"
+    # A `KeyError` would only say `'session'` and an `int()` failure only
+    # `invalid literal`, neither of which names the turn.
+    for body, needle in ((dict(role="user", turn=0, text="x"), "no session field"),
+                         (dict(session=0, role="user", turn="x", text="a"),
+                          "turn 'x' is not an int"),
+                         (dict(session=0, role="user", turn=0, text="a", ts="soon"),
+                          "ts 'soon' is not a float"),
+                         (dict(session=0, role="user", turn=0, text="a", tags="run:r"),
+                          None),
+                         (dict(session=0, role="user", turn=0, text="a", tags=[1]),
+                          "tag 1 is not a string"),
+                         (dict(session=0, role="user", turn=0, text="a", tags={"run": "r"}),
+                          r"tags .* is not a list")):
+        log.write_text(json.dumps(body), encoding="utf-8")
+        if needle is None:
+            # A bare tag string is wrapped, not split into characters.
+            assert evaluation.parse(log)[0].tags == ["run:r"]
+            continue
+        with pytest.raises(ValueError, match=rf"t\.jsonl:0: {needle}"):
+            evaluation.parse(log)
+
+
+def test_a_non_numeric_step_tag_is_refused_by_turn(tmp_path):
+    log = tmp_path / "t.jsonl"
+    log.write_text("\n".join(json.dumps(b) for b in (
+        dict(session=0, turn=0, role="user", text="a", tags=["run:r", "step:soon"]),
+        dict(session=0, turn=1, role="assistant", text="b"))), encoding="utf-8")
+    ground = tmp_path / "g.json"
+    ground.write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match=r"0\.0 has step 'soon', not an integer"):
+        evaluation.from_log(log, ground, tmp_path / "o.json")
+
+
+def test_the_cli_names_a_ground_file_that_is_not_an_object(tmp_path, capsys):
+    ground = tmp_path / "g.json"
+    ground.write_text("[]", encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:
+        evaluation.main([str(DATA / "repetition_eval.jsonl"), "--out",
+                         str(tmp_path / "o.json"), "--ground", str(ground)])
+    assert exc.value.code == 2
+    assert "g.json: ground must be a JSON object" in capsys.readouterr().err
+
+
 def test_an_empty_transcript_reports_nothing_rather_than_failing():
     got = evaluation.score([], {}, risk_min=0.5)
     assert (got.precision, got.recall) == (None, None)

@@ -721,6 +721,130 @@ def test_a_reinit_that_would_cost_loss_is_reverted(pm, ladder, buffer, monkeypat
         assert torch.equal(p.detach(), seen["before"][n])
 
 
+def test_hold_out_takes_the_least_important_items_the_replay_left(pm, ladder, buffer):
+    from sleepy.sleep import hold_out
+
+    cfg = _cfg(reinit=True, reinit_holdout=16, batch_items=4, k_important=8)
+    items = buffer.all()[:8]
+    candidates = buffer.all()
+    got = hold_out(cfg, candidates, items)
+    # Capped to one batch and taken from the tail of the importance-sorted pool.
+    assert [i.text for i in got] == [i.text for i in candidates[-4:]]
+    assert not {i.key() for i in got} & {i.key() for i in items}
+
+
+def test_hold_out_is_empty_when_nothing_is_left_over(pm, ladder, buffer):
+    from sleepy.sleep import hold_out
+
+    # Every pool item is replayed: no second opinion to be had, so the caller
+    # falls back to the replay batch.
+    assert hold_out(_cfg(reinit=True), buffer.all(), buffer.all()) == []
+    # ...and nothing is held out at all unless a reinit will read it.
+    assert hold_out(_cfg(reinit_holdout=0), buffer.all(), buffer.all()[:4]) == []
+    assert hold_out(_cfg(), buffer.all(), buffer.all()[:4]) == []
+
+
+def _check_forwards(pm, log):
+    """Mark where the reinit runs and record every forward's ids into `log`.
+
+    The blank is a marker in the same list as the forwards, so the reading just
+    before it is unambiguously the check's before-reading.
+    """
+    real = components.reinitialize
+
+    def mark(*a, **kw):
+        log.append(("blank", None))
+        return real(*a, **kw)
+
+    def hook(mod, args, kwargs):
+        ids = kwargs.get("input_ids")
+        if ids is not None:
+            log.append(("fwd", ids.clone()))
+
+    pm.register_forward_pre_hook(hook, with_kwargs=True)
+    return mark
+
+
+def _around(log):
+    """(check batch, that same batch after the blank, forwards before the check).
+
+    The after-reading is searched forward rather than taken from the next call:
+    a mid-window blank trains the rest of the window first, so the judgement is
+    several forwards past the blank and the check batch is the only one all of
+    them share with the reading before.
+    """
+    i = next(n for n, (kind, _) in enumerate(log) if kind == "blank")
+    assert log[i - 1][0] == "fwd"
+    before = log[i - 1][1]
+    after = next(ids for kind, ids in log[i + 1:] if kind == "fwd" and ids.equal(before))
+    trained = []
+    for kind, ids in log[: i - 1]:
+        if kind == "fwd" and not any(ids.equal(t) for t in trained):
+            trained.append(ids)
+    return before, after, trained
+
+
+def test_the_check_runs_on_held_out_items_not_the_trained_batch(pm, ladder, buffer,
+                                                               monkeypatch):
+    """The readout and the check must not share a blind spot.
+
+    A component whose knowledge the replay batch never exercises reads both
+    unimportant and unmoving, and a check on that same batch would call the
+    blank free. The check therefore runs on items the window never trained.
+    """
+    run(pm, ladder, buffer, ladder.slots[2], _cfg(budget_steps=40))
+    log = []
+    mark = _check_forwards(pm, log)
+    monkeypatch.setattr(components, "reinitialize", mark)
+
+    run(pm, ladder, buffer, ladder.slots[2],
+        _cfg(reinit=True, reinit_importance=1.0, reinit_movement=1.0,
+             reinit_loss_tol=1e9, k_important=4, core_frac=0.0, budget_steps=4))
+
+    before, after, trained = _around(log)
+    assert before.equal(after)                          # one batch both sides
+    # Held-out items are never replayed or probed, so the check batch is none of
+    # the batches the window saw before it.
+    assert trained and not any(before.equal(t) for t in trained)
+
+
+def test_the_mid_window_check_also_runs_on_held_out_items(pm, ladder, buffer,
+                                                          monkeypatch):
+    run(pm, ladder, buffer, ladder.slots[2], _cfg(budget_steps=40))
+    log = []
+    mark = _check_forwards(pm, log)
+    monkeypatch.setattr(components, "reinitialize", mark)
+
+    run(pm, ladder, buffer, ladder.slots[2],
+        _cfg(reinit=True, reinit_importance=1.0, reinit_movement=1.0,
+             reinit_loss_tol=1e9, reinit_at=0.5, k_important=4, core_frac=0.0,
+             budget_steps=6, lr=0.2))
+
+    before, after, trained = _around(log)
+    assert before.equal(after)
+    assert trained and not any(before.equal(t) for t in trained)
+
+
+def test_an_empty_holdout_falls_back_to_the_trained_batch(pm, ladder, buffer,
+                                                          monkeypatch):
+    # Every pool item replays, so the check has the replay batch as its only
+    # reading — it must still run, on the batch the probe already encoded.
+    run(pm, ladder, buffer, ladder.slots[2], _cfg(budget_steps=40))
+    log = []
+    mark = _check_forwards(pm, log)
+    monkeypatch.setattr(components, "reinitialize", mark)
+
+    run(pm, ladder, buffer, ladder.slots[2],
+        _cfg(reinit=True, reinit_importance=1.0, reinit_movement=1.0,
+             reinit_loss_tol=1e9, k_important=64, core_frac=0.0, budget_steps=4))
+
+    before, after, trained = _around(log)
+    assert before.equal(after)
+    # Nothing was held out, so the check falls back to the replay batch — one
+    # the window did see.
+    assert any(before.equal(t) for t in trained)
+
+
 # -- mid-window reinit --------------------------------------------------
 @pytest.mark.parametrize("at,shown", [
     (0.0, None), (0.5, 2), (0.9, 4), (1.0, None), (2.0, None)])

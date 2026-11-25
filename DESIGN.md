@@ -497,23 +497,35 @@ zeroed `aᵢ` row has no direction for a gradient to establish, so the component
 would never start again. Every other row and column is left bit-identical.
 
 **It runs at the end of the sleep, and it is checked.** Running it there means
-it acts on the whole window's readouts rather than a half-formed one, and the
-sleep's own batch is already encoded. The loss on that batch is taken before and
-after on the same items — neighbouring batches differ by far more than a
-reinit — and a rise beyond `reinit_loss_tol` relative restores the saved
-factors exactly. Nothing has trained since, so the restore is total. Both
+it acts on the whole window's readouts rather than a half-formed one. The loss
+is taken before and after on the same items — neighbouring batches differ by far
+more than a reinit — and a rise beyond `reinit_loss_tol` relative restores the
+saved factors exactly. Nothing has trained since, so the restore is total. Both
 counts are reported: `reinitialized` for what stood, `reinit_reverted` for what
 the check refused. A non-finite after-loss counts as a rise and reverts too: the
 rule restores on a *rise*, and NaN is not one, but a broken slot is not a
 successful reinit either.
 
+**The check does not run on the trained batch.** The same replay batch decides
+that a component is dead and then judges what blanking it costs, so it holds
+one blind spot twice: a component whose knowledge that batch never exercises
+reads unimportant *and* reads free, and a blank that in fact lost knowledge
+passes unchecked. The check is therefore taken on items held out of the window —
+the least important pool items the replay and the associative expansion left
+over, capped to one batch (`reinit_holdout`) — so the readout and the cost are
+two opinions over two samples rather than one opinion over one. It is still a
+relative check on the same items both sides, so it catches a break as readily as
+a loss. Where nothing is left over the replay batch returns; the second opinion
+is what a reinit should have, not what it may require before running at all.
+
 **The blank can land mid-window instead, and is judged later when it does.**
 `reinit_at` is the fraction of the budget the blank lands at, and its default of
 1.0 is the end-of-window path above. Earlier, the steps that remain train the
 fresh directions before anything is judged, and the judgement then happens after
-the window on the *trigger's* own batch — kept in hand so the two readings are
-comparable — so a blank the rest of the window repaid stands and one it did not
-is restored exactly. The readouts are still taken at the trigger, because they
+the window on the held-out batch, kept in hand from the trigger so the two
+readings are comparable — falling back to the *trigger's* own batch when nothing
+was left to hold out — so a blank the rest of the window repaid stands and one it
+did not is restored exactly. The readouts are still taken at the trigger, because they
 describe the steps that led to it rather than the ones that follow. The end of
 the window is right when the question is what the blank costs; a position before
 it is right when the question is what the blank is worth, which is the one that
@@ -528,8 +540,9 @@ dimensions the slot no longer uses.
 
 **Off by default.** The readout has a genuine blind spot — a component whose
 carried knowledge the sleep's own batch does not exercise reads both
-unimportant and unmoving — and the reinit explicitly relies on that same batch
-as its only second opinion. Dying components starve their neighbours' gradient
+unimportant and unmoving — and the check above is what separates the two
+readings of it, at the cost of a held-out batch the window never trains on.
+Dying components starve their neighbours' gradient
 through interference, so on the right task the compounding benefit is real, but
 it is unmeasured here, which is the same bar rejuvenation was held to.
 
@@ -1139,15 +1152,17 @@ Resolved, with the evidence that closed each one:
   `block_every` sleeps rather than resuming it. That is the safe direction —
   a stale acceptance never outlives the model it was measured on — but it also
   means the cost is paid again after every restart.
-* **A reinit is judged on the batch that also judged the readout.** §6.4
-  restores on a loss rise, but that same batch is what decided the components
-  were dead, so a component whose knowledge the batch never exercises reads both
-  unimportant and unmoving and passes the check unchanged. The two opinions are
-  not independent. A held-out batch would be the fix and costs a second encode
-  and two forwards per window. At `reinit_at < 1.0` the readout is no better,
-  but the judgement is partly independent: the trigger batch's after-loss is
-  taken after the window has trained, and training on the other batches is
-  movement that batch's own reading could not have supplied.
+* **The reinit's two opinions are separated, but not measured against each
+  other.** §6.4 now judges the blank on a batch held out of the window, so the
+  readout and the cost are no longer one opinion over one sample. What is not
+  known is whether the check batch is a *good* second opinion: it is drawn from
+  the least important end of the pool, which is to say from the material the
+  readout already thought least likely to matter, and held-out loss is not the
+  replay loss the window was fitted to. Where nothing is left over the fallback
+  returns to the deciding batch and the blind spot is whole again. At
+  `reinit_at < 1.0` the judgement is partly independent even in the fallback,
+  because the after-loss is taken after the rest of the window has trained — but
+  that is movement the trained batch supplied, not evidence the readout lacked.
 * **Adaptive depth's "converged" is a proxy.** §6.5 compares a batch's loss
   across steps, which is a loss movement, not a measurement that the batch *is*
   converged; a batch whose loss oscillates reads as converged and loses a pass it

@@ -87,6 +87,14 @@ class SleepConfig:
     reinit_movement: float = 0.25
     # Relative loss the reinit batch may rise by and still be accepted.
     reinit_loss_tol: float = 0.01
+    # Items held out of replay for the check, from the least important end of
+    # the pool. The readout that calls a component dead and the check that
+    # judges the blank share their blind spot while both read the trained
+    # batch: a component whose knowledge the batch never exercises reads both
+    # unimportant and unmoving, and the check trained on the same items could
+    # not notice. Held out, the two opinions are separate. 0 falls back to the
+    # replay batch. Capped to `batch_items` at use.
+    reinit_holdout: int = 16
     # Where in the budget the blanking lands, as a fraction of it. At 1.0 it is
     # the last thing a sleep does and the next sleep is the first to touch the
     # blanked rows — so the blank is judged only by the loss it costs, never by
@@ -508,6 +516,30 @@ def select(buffer: Buffer, cfg: SleepConfig, rng: random.Random,
     return keep
 
 
+def hold_out(cfg: SleepConfig, candidates: list[Item],
+             items: list[Item]) -> list[Item]:
+    """The reinit's check batch: least important pool items the replay did not take.
+
+    A reinit decides two things about each component — that nothing needs it,
+    and that blanking it costs nothing — and by default both are read on the
+    sleep's own replay batch. That batch is what trained the slot, so a
+    component whose knowledge it does not exercise reads as unimportant *and*
+    the blank on it reads free. Two opinions, one blind spot.
+
+    These items are never replayed, so probing on them reads what the window
+    did not specifically train. Taken from the least important end (the pool is
+    sorted by `importance`), because the point is coverage rather than the
+    hardest material, and capped to one batch. Empty when nothing was left over
+    — the caller falls back to the replay batch, which is still the right
+    choice when there is no second opinion to be had.
+    """
+    if not cfg.reinit or cfg.reinit_holdout <= 0:
+        return []
+    replay = {i.key() for i in items}
+    free = [c for c in candidates if c.key() not in replay]
+    return free[-min(cfg.reinit_holdout, cfg.batch_items):]
+
+
 def _next_depth(n: int, prev: float, now: float, cfg: SleepConfig) -> int:
     """Shrink or widen the pass count by one from the loss movement on a batch.
 
@@ -613,6 +645,12 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
                                           cfg.assoc_min, cfg.assoc_share)
     # Every selected item lands exactly once: `expand` is additive and draws
     # from `pool`, which is disjoint from `items`.
+    #
+    # The reinit check's own items, split off here and never replayed. See
+    # `hold_out` for why the check may not use the batch that decided the
+    # readout.
+    holdout = hold_out(cfg, candidates, items)
+    check_batch = encode(cfg, render(holdout)) if holdout else None
 
     # Repetition detection, then corrections, then the window check. None
     # touches the replay batch — the correction's own tokens are never among
@@ -885,14 +923,19 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
             stamp = components.stale_mask(imp_now, plasticity, was_measured,
                                           cfg.reinit_importance, cfg.reinit_movement)
             if stamp is not None and items:
+                # The check is taken on the held-out batch, not this step's
+                # replay batch: the replay batch is what decided the readout,
+                # so a blank that costs loss on material the window never
+                # trained would look free on it. Falls back to the replay batch
+                # when there was nothing to hold out.
+                blank_batch = check_batch if check_batch is not None else batch
                 with torch.no_grad():
                     was_training = pm.training
                     try:
                         pm.eval()
-                        blank_loss = float(pm(**batch).loss)
+                        blank_loss = float(pm(**blank_batch).loss)
                     finally:
                         pm.train(was_training)
-                blank_batch = batch
                 saved = components.reinitialize(pm, slot.name, stamp,
                                                 cfg.budget_steps - mid)
                 blanks = components.count(stamp)
@@ -984,19 +1027,24 @@ def _run(pm, ladder: Ladder, buffer: Buffer, slot: Slot, cfg: SleepConfig,
         if mask is not None:
             # Blanking the components can only cost what they carried, and the
             # readout is what decided they carried nothing — so the check is a
-            # second opinion on that, on the sleep's own batch, not a training
-            # signal. Same batch both sides: neighbouring batches differ by far
-            # more than a reinit does.
+            # second opinion on that, not a training signal. Taken on the best
+            # available second opinion: the held-out batch, which the window
+            # never trained, so a component the replay batch does not exercise
+            # can still show its cost. Falls back to the replay batch when
+            # nothing was held out, where the check at least catches a break.
+            # Same batch both sides either way: neighbouring batches differ by
+            # far more than a reinit does.
+            check = check_batch if check_batch is not None else probed
             was_training = pm.training
             try:
                 with torch.no_grad():
                     pm.eval()
-                    start = float(pm(**probed).loss)
+                    start = float(pm(**check).loss)
                 saved = components.reinitialize(pm, slot.name, mask)
                 after = start
                 if saved:
                     with torch.no_grad():
-                        after = float(pm(**probed).loss)
+                        after = float(pm(**check).loss)
             finally:
                 # A raise here leaves a blanked slot behind and the caller
                 # quarantines it, so the mode still has to come back.
